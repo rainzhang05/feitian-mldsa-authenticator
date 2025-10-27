@@ -17,10 +17,14 @@ use p256::{
 };
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
+use trussed::client::{Client as TrussedClient, CryptoClient, FilesystemClient};
+use trussed::syscall;
+#[cfg(not(test))]
+use trussed::types::PathBuf;
+#[cfg(not(test))]
 use trussed::{
-    client::{Client as TrussedClient, CryptoClient, FilesystemClient},
-    syscall, try_syscall,
-    types::{Location, Message, PathBuf},
+    try_syscall,
+    types::{Location, Message},
 };
 use trussed_mlkem::{self, Ciphertext, ParamSet as KemParamSet, SecretKey as KemSecretKey};
 use zeroize::Zeroize;
@@ -53,7 +57,13 @@ const MAX_PIN_FAILURES_BEFORE_BLOCK: u8 = 3;
 
 type HmacSha256 = Hmac<Sha256>;
 
+#[cfg(not(test))]
 const CREDENTIAL_STORE_PATH: &str = "credentials.cbor";
+const PIN_UV_AUTH_PROTOCOL_CLASSIC: i32 = 2;
+const SUPPORTED_PIN_UV_PROTOCOLS: [i32; 2] = [
+    PIN_UV_AUTH_PROTOCOL_PQC as i32,
+    PIN_UV_AUTH_PROTOCOL_CLASSIC,
+];
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct StoredCredential {
@@ -301,8 +311,94 @@ impl PinProtocolSession {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use ciborium::ser::into_writer;
+    use ciborium::{
+        de::from_reader,
+        ser::into_writer,
+        value::{Integer, Value},
+    };
+    use core::task::Poll;
+    use p256::{
+        ecdh::diffie_hellman, EncodedPoint, PublicKey as P256PublicKey, SecretKey as P256SecretKey,
+    };
+    use sha2::{Digest, Sha256};
+    use std::{collections::HashMap, convert::TryInto};
+    use trussed::api::{reply, Reply, Request, RequestVariant};
+    use trussed::client::{
+        AttestationClient, CertificateClient, Client as TrussedClient, ClientResult, CounterClient,
+        CryptoClient, FilesystemClient, FutureResult, ManagementClient, PollClient, UiClient,
+    };
+    use trussed::error::Error as TrussedError;
+    use trussed::types::Message;
     use trussed_mlkem::{ParamSet as KemParamSet, SecretKey as KemSecretKey};
+    use zeroize::Zeroize;
+
+    #[derive(Default)]
+    struct TestClient {
+        pending: Option<Result<Reply, TrussedError>>,
+        random_counter: u8,
+        files: HashMap<Vec<u8>, Vec<u8>>,
+    }
+
+    impl TestClient {
+        fn new() -> Self {
+            Self::default()
+        }
+
+        fn dispatch(&mut self, request: Request) -> Result<Reply, TrussedError> {
+            match request {
+                Request::RandomBytes(req) => {
+                    let mut bytes = Vec::with_capacity(req.count);
+                    for _ in 0..req.count {
+                        bytes.push(self.random_counter);
+                        self.random_counter = self.random_counter.wrapping_add(1);
+                    }
+                    let message = Message::from_slice(&bytes).expect("random bytes fit message");
+                    Ok(Reply::from(reply::RandomBytes { bytes: message }))
+                }
+                Request::WriteFile(req) => {
+                    let path_key = req.path.as_str().as_bytes().to_vec();
+                    let data = req.data.as_slice().to_vec();
+                    self.files.insert(path_key, data);
+                    Ok(Reply::from(reply::WriteFile {}))
+                }
+                Request::ReadFile(req) => {
+                    let path_key = req.path.as_str().as_bytes().to_vec();
+                    if let Some(data) = self.files.get(&path_key) {
+                        let message = Message::from_slice(data).expect("stored file fits message");
+                        Ok(Reply::from(reply::ReadFile { data: message }))
+                    } else {
+                        Err(TrussedError::FilesystemReadFailure)
+                    }
+                }
+                _ => Err(TrussedError::FunctionNotSupported),
+            }
+        }
+    }
+
+    impl PollClient for TestClient {
+        fn request<Rq: RequestVariant>(&mut self, req: Rq) -> ClientResult<'_, Rq::Reply, Self> {
+            assert!(self.pending.is_none(), "a request is already pending");
+            let request: Request = req.into();
+            self.pending = Some(self.dispatch(request));
+            Ok(FutureResult::new(self))
+        }
+
+        fn poll(&mut self) -> Poll<Result<Reply, TrussedError>> {
+            match self.pending.take() {
+                Some(result) => Poll::Ready(result),
+                None => Poll::Pending,
+            }
+        }
+    }
+
+    impl CryptoClient for TestClient {}
+    impl FilesystemClient for TestClient {}
+    impl AttestationClient for TestClient {}
+    impl CertificateClient for TestClient {}
+    impl CounterClient for TestClient {}
+    impl ManagementClient for TestClient {}
+    impl UiClient for TestClient {}
+    impl TrussedClient for TestClient {}
 
     #[test]
     fn pqc_key_agreement_value_is_canonical_akp_map() {
@@ -322,6 +418,315 @@ mod tests {
         let expected = vec![0xA3, 0x01, 0x07, 0x03, 0x38, 0x6D, 0x20, 0x42, 0x01, 0x02];
         assert_eq!(encoded, expected);
     }
+
+    fn request_classic_key_agreement(app: &mut CtapApp<TestClient>) -> Vec<(Value, Value)> {
+        let request = Value::Map(vec![
+            (
+                Value::Integer(Integer::from(1)),
+                Value::Integer(Integer::from(PIN_UV_AUTH_PROTOCOL_CLASSIC)),
+            ),
+            (
+                Value::Integer(Integer::from(2)),
+                Value::Integer(Integer::from(0x02)),
+            ),
+        ]);
+        let mut payload = Vec::new();
+        into_writer(&request, &mut payload).expect("serialize key agreement request");
+        let response = app
+            .handle_client_pin(&payload)
+            .expect("classic key agreement succeeds");
+        assert_eq!(response[0], CTAP2_OK);
+        let Value::Map(map) = from_reader(&response[1..]).expect("decode key agreement response")
+        else {
+            panic!("response must be a map");
+        };
+        match map
+            .into_iter()
+            .find(|(k, _)| *k == Value::Integer(Integer::from(1)))
+        {
+            Some((_, Value::Map(entries))) => entries,
+            _ => panic!("missing key agreement data"),
+        }
+    }
+
+    fn extract_coordinate(entries: &[(Value, Value)], label: i32) -> Vec<u8> {
+        entries
+            .iter()
+            .find(|(k, _)| *k == Value::Integer(Integer::from(label)))
+            .and_then(|(_, v)| match v {
+                Value::Bytes(bytes) => Some(bytes.clone()),
+                _ => None,
+            })
+            .expect("coordinate is present")
+    }
+
+    fn authenticator_public_key(entries: &[(Value, Value)]) -> P256PublicKey {
+        let x = extract_coordinate(entries, -2);
+        let y = extract_coordinate(entries, -3);
+        assert_eq!(x.len(), 32);
+        assert_eq!(y.len(), 32);
+        let mut encoded = [0u8; 65];
+        encoded[0] = 0x04;
+        encoded[1..33].copy_from_slice(&x);
+        encoded[33..65].copy_from_slice(&y);
+        P256PublicKey::from_sec1_bytes(&encoded).expect("authenticator public key is valid")
+    }
+
+    fn classic_platform_key_entries(point: &EncodedPoint) -> Vec<(Value, Value)> {
+        let x_field = point.x().expect("x coordinate present");
+        let x_slice: &[u8] = x_field.as_ref();
+        let x = x_slice.to_vec();
+        let y_field = point.y().expect("y coordinate present");
+        let y_slice: &[u8] = y_field.as_ref();
+        let y = y_slice.to_vec();
+        vec![
+            (
+                Value::Integer(Integer::from(1)),
+                Value::Integer(Integer::from(PIN_UV_AUTH_PROTOCOL_CLASSIC)),
+            ),
+            (
+                Value::Integer(Integer::from(3)),
+                Value::Integer(Integer::from(-25)),
+            ),
+            (
+                Value::Integer(Integer::from(-1)),
+                Value::Integer(Integer::from(1)),
+            ),
+            (Value::Integer(Integer::from(-2)), Value::Bytes(x)),
+            (Value::Integer(Integer::from(-3)), Value::Bytes(y)),
+        ]
+    }
+
+    fn derive_classic_session(
+        auth_entries: &[(Value, Value)],
+        platform_secret: &P256SecretKey,
+    ) -> (PinUvSessionKeys, Vec<u8>, Vec<(Value, Value)>) {
+        let auth_public = authenticator_public_key(auth_entries);
+        let platform_public = platform_secret.public_key().to_encoded_point(false);
+        let shared = diffie_hellman(platform_secret.to_nonzero_scalar(), auth_public.as_affine());
+        let auth_encoded = auth_public.to_encoded_point(false);
+        let mut hasher = Sha256::new();
+        hasher.update(auth_encoded.as_bytes());
+        hasher.update(platform_public.as_bytes());
+        let transcript_hash = hasher.finalize().to_vec();
+        let shared_bytes = shared.raw_secret_bytes();
+        let keys = crate::derive_pin_uv_session_keys(shared_bytes.as_ref(), &transcript_hash);
+        let platform_entries = classic_platform_key_entries(&platform_public);
+        (keys, transcript_hash, platform_entries)
+    }
+
+    #[test]
+    fn classic_pin_uv_protocol_flow() {
+        let mut app = CtapApp::new(TestClient::new(), [0xA5; 16]);
+        let pin = b"123456";
+        let nonce = [0u8; 12];
+
+        // Set the initial PIN using the classic protocol.
+        let auth_key_entries = request_classic_key_agreement(&mut app);
+        let platform_secret = P256SecretKey::from_slice(&[0x11; 32]).expect("valid secret key");
+        let (set_keys, set_transcript_hash, platform_entries) =
+            derive_classic_session(&auth_key_entries, &platform_secret);
+        let mut new_pin_block = [0u8; 64];
+        new_pin_block[..pin.len()].copy_from_slice(pin);
+        let new_pin_enc =
+            crate::encrypt_pin_block(&set_keys, &nonce, &new_pin_block, &set_transcript_hash);
+        new_pin_block.zeroize();
+        let mut pin_mac = HmacSha256::new_from_slice(&set_keys.auth_key).expect("valid MAC key");
+        pin_mac.update(&new_pin_enc);
+        let pin_auth = pin_mac.finalize().into_bytes();
+        let set_pin_request = Value::Map(vec![
+            (
+                Value::Integer(Integer::from(1)),
+                Value::Integer(Integer::from(PIN_UV_AUTH_PROTOCOL_CLASSIC)),
+            ),
+            (
+                Value::Integer(Integer::from(2)),
+                Value::Integer(Integer::from(0x03)),
+            ),
+            (
+                Value::Integer(Integer::from(3)),
+                Value::Map(platform_entries.clone()),
+            ),
+            (
+                Value::Integer(Integer::from(4)),
+                Value::Bytes(pin_auth[..16].to_vec()),
+            ),
+            (Value::Integer(Integer::from(5)), Value::Bytes(new_pin_enc)),
+        ]);
+        let mut payload = Vec::new();
+        into_writer(&set_pin_request, &mut payload).expect("serialize setPin request");
+        let response = app.handle_client_pin(&payload).expect("setPin succeeds");
+        assert_eq!(response, vec![CTAP2_OK]);
+        assert!(app.pin_state.is_set());
+
+        // Retrieve the PIN/UV token using the classic protocol.
+        let auth_key_entries = request_classic_key_agreement(&mut app);
+        let platform_secret = P256SecretKey::from_slice(&[0x22; 32]).expect("valid secret key");
+        let (token_keys, token_transcript_hash, platform_entries) =
+            derive_classic_session(&auth_key_entries, &platform_secret);
+        let mut hasher = Sha256::new();
+        hasher.update(pin);
+        let pin_digest = hasher.finalize();
+        let pin_hash = &pin_digest[..16];
+        let pin_hash_enc =
+            crate::encrypt_pin_block(&token_keys, &nonce, pin_hash, &token_transcript_hash);
+        let mut token_mac =
+            HmacSha256::new_from_slice(&token_keys.auth_key).expect("valid MAC key");
+        token_mac.update(&pin_hash_enc);
+        let pin_hash_auth = token_mac.finalize().into_bytes();
+        let get_token_request = Value::Map(vec![
+            (
+                Value::Integer(Integer::from(1)),
+                Value::Integer(Integer::from(PIN_UV_AUTH_PROTOCOL_CLASSIC)),
+            ),
+            (
+                Value::Integer(Integer::from(2)),
+                Value::Integer(Integer::from(0x05)),
+            ),
+            (
+                Value::Integer(Integer::from(3)),
+                Value::Map(platform_entries.clone()),
+            ),
+            (
+                Value::Integer(Integer::from(4)),
+                Value::Bytes(pin_hash_auth[..16].to_vec()),
+            ),
+            (
+                Value::Integer(Integer::from(6)),
+                Value::Bytes(pin_hash_enc.clone()),
+            ),
+        ]);
+        let mut payload = Vec::new();
+        into_writer(&get_token_request, &mut payload).expect("serialize getPinToken request");
+        let response = app
+            .handle_client_pin(&payload)
+            .expect("getPinToken succeeds");
+        assert_eq!(response[0], CTAP2_OK);
+        let Value::Map(map) = from_reader(&response[1..]).expect("decode getPinToken response")
+        else {
+            panic!("response must be a map");
+        };
+        let encrypted_token = map
+            .iter()
+            .find(|(k, _)| *k == Value::Integer(Integer::from(2)))
+            .and_then(|(_, v)| match v {
+                Value::Bytes(bytes) => Some(bytes.clone()),
+                _ => None,
+            })
+            .expect("encrypted token present");
+        let pin_uv_auth_token_vec = crate::decrypt_pin_block(
+            &token_keys,
+            &nonce,
+            &encrypted_token,
+            &token_transcript_hash,
+        )
+        .expect("token decrypts");
+        assert_eq!(pin_uv_auth_token_vec.len(), 32);
+        let pin_uv_auth_token: [u8; 32] = pin_uv_auth_token_vec
+            .as_slice()
+            .try_into()
+            .expect("token length is 32");
+        let stored_token = app
+            .pin_state
+            .pin_uv_auth_token()
+            .expect("token stored in state");
+        assert_eq!(stored_token, pin_uv_auth_token);
+
+        // Make a credential using the classic protocol pinUvAuthParam.
+        let client_data_hash_mc = vec![0xAA; 32];
+        let mut mac = HmacSha256::new_from_slice(&pin_uv_auth_token).expect("valid token MAC");
+        mac.update(&client_data_hash_mc);
+        let pin_uv_auth_param_mc: Vec<u8> = mac.finalize().into_bytes()[..16].to_vec();
+        let rp = Value::Map(vec![(
+            Value::Text("id".into()),
+            Value::Text("example.com".into()),
+        )]);
+        let user = Value::Map(vec![
+            (Value::Text("id".into()), Value::Bytes(vec![0x01, 0x02])),
+            (Value::Text("name".into()), Value::Text("example".into())),
+            (
+                Value::Text("displayName".into()),
+                Value::Text("Example".into()),
+            ),
+        ]);
+        let pub_key_params = Value::Array(vec![Value::Map(vec![
+            (Value::Text("type".into()), Value::Text("public-key".into())),
+            (
+                Value::Text("alg".into()),
+                Value::Integer(Integer::from(CoseAlg::MLDSA44 as i32)),
+            ),
+        ])]);
+        let make_credential = Value::Map(vec![
+            (
+                Value::Integer(Integer::from(1)),
+                Value::Bytes(client_data_hash_mc.clone()),
+            ),
+            (Value::Integer(Integer::from(2)), rp),
+            (Value::Integer(Integer::from(3)), user),
+            (Value::Integer(Integer::from(4)), pub_key_params),
+            (
+                Value::Integer(Integer::from(8)),
+                Value::Bytes(pin_uv_auth_param_mc.clone()),
+            ),
+            (
+                Value::Integer(Integer::from(9)),
+                Value::Integer(Integer::from(PIN_UV_AUTH_PROTOCOL_CLASSIC)),
+            ),
+        ]);
+        if let Value::Map(entries) = &make_credential {
+            let protocol = entries
+                .iter()
+                .find(|(k, _)| *k == Value::Integer(Integer::from(9)))
+                .and_then(|(_, v)| match v {
+                    Value::Integer(int) => Some(int.clone()),
+                    _ => None,
+                })
+                .expect("protocol present");
+            let protocol_value: i128 = protocol.into();
+            assert_eq!(
+                protocol_value,
+                i128::from(PIN_UV_AUTH_PROTOCOL_CLASSIC),
+                "protocol value matches"
+            );
+        }
+        let mut payload = Vec::new();
+        into_writer(&make_credential, &mut payload).expect("serialize makeCredential request");
+        let response = app
+            .handle_make_credential(&payload)
+            .expect("makeCredential succeeds");
+        assert_eq!(response[0], CTAP2_OK);
+
+        // Use the stored token to get an assertion via the classic protocol path.
+        let client_data_hash_ga = vec![0xBB; 32];
+        let mut mac = HmacSha256::new_from_slice(&pin_uv_auth_token).expect("valid token MAC");
+        mac.update(&client_data_hash_ga);
+        let pin_uv_auth_param_ga: Vec<u8> = mac.finalize().into_bytes()[..16].to_vec();
+        let get_assertion = Value::Map(vec![
+            (
+                Value::Integer(Integer::from(1)),
+                Value::Text("example.com".into()),
+            ),
+            (
+                Value::Integer(Integer::from(2)),
+                Value::Bytes(client_data_hash_ga.clone()),
+            ),
+            (
+                Value::Integer(Integer::from(6)),
+                Value::Bytes(pin_uv_auth_param_ga.clone()),
+            ),
+            (
+                Value::Integer(Integer::from(7)),
+                Value::Integer(Integer::from(PIN_UV_AUTH_PROTOCOL_CLASSIC)),
+            ),
+        ]);
+        let mut payload = Vec::new();
+        into_writer(&get_assertion, &mut payload).expect("serialize getAssertion request");
+        let response = app
+            .handle_get_assertion(&payload)
+            .expect("getAssertion succeeds");
+        assert_eq!(response[0], CTAP2_OK);
+        assert!(app.pin_state.pin_uv_auth_token().is_some());
+    }
 }
 
 pub struct CtapApp<C> {
@@ -330,6 +735,8 @@ pub struct CtapApp<C> {
     pin_state: PinState,
     pin_protocol_session: Option<PinProtocolSession>,
     platform_declined_pqc: bool,
+    #[cfg(test)]
+    stored_credentials: Vec<StoredCredential>,
 }
 
 impl<C> CtapApp<C> {
@@ -340,6 +747,8 @@ impl<C> CtapApp<C> {
             pin_state: PinState::new(),
             pin_protocol_session: None,
             platform_declined_pqc: false,
+            #[cfg(test)]
+            stored_credentials: Vec::new(),
         }
     }
 }
@@ -402,6 +811,18 @@ where
         let mut out = [0u8; 16];
         out.copy_from_slice(&digest[..16]);
         out
+    }
+
+    fn ensure_supported_pin_uv_protocol(protocol: i128) -> Result<(), u8> {
+        if protocol < i32::MIN as i128 || protocol > i32::MAX as i128 {
+            return Err(CTAP2_ERR_PIN_AUTH_INVALID);
+        }
+        let protocol_i32 = protocol as i32;
+        if SUPPORTED_PIN_UV_PROTOCOLS.contains(&protocol_i32) {
+            Ok(())
+        } else {
+            Err(CTAP2_ERR_PIN_AUTH_INVALID)
+        }
     }
 
     fn as_array<const N: usize>(bytes: &[u8]) -> Result<[u8; N], u8> {
@@ -645,10 +1066,12 @@ where
         }
     }
 
+    #[cfg(not(test))]
     fn store_path() -> Result<PathBuf, u8> {
         PathBuf::try_from(CREDENTIAL_STORE_PATH).map_err(|_| CTAP2_ERR_PROCESSING)
     }
 
+    #[cfg(not(test))]
     fn load_credentials(&mut self) -> Result<Vec<StoredCredential>, u8> {
         let path = Self::store_path()?;
         match try_syscall!(self.client.read_file(Location::Internal, path.clone())) {
@@ -664,6 +1087,12 @@ where
         }
     }
 
+    #[cfg(test)]
+    fn load_credentials(&mut self) -> Result<Vec<StoredCredential>, u8> {
+        Ok(self.stored_credentials.clone())
+    }
+
+    #[cfg(not(test))]
     fn save_credentials(&mut self, creds: &[StoredCredential]) -> Result<(), u8> {
         let mut encoded = Vec::new();
         into_writer(creds, &mut encoded).map_err(|_| CTAP2_ERR_PROCESSING)?;
@@ -673,6 +1102,12 @@ where
             .client
             .write_file(Location::Internal, path, message, None))
         .map_err(|_| CTAP2_ERR_PROCESSING)?;
+        Ok(())
+    }
+
+    #[cfg(test)]
+    fn save_credentials(&mut self, creds: &[StoredCredential]) -> Result<(), u8> {
+        self.stored_credentials = creds.to_vec();
         Ok(())
     }
 
@@ -754,7 +1189,7 @@ where
             Value::Integer(Integer::from(6)),
             Value::Array(vec![
                 Value::Integer(Integer::from(i32::from(PIN_UV_AUTH_PROTOCOL_PQC))),
-                Value::Integer(Integer::from(2)),
+                Value::Integer(Integer::from(PIN_UV_AUTH_PROTOCOL_CLASSIC)),
             ]),
         ));
 
@@ -911,9 +1346,7 @@ where
             (pin_uv_auth_param.as_ref(), pin_uv_auth_protocol)
         {
             let value: i128 = protocol.into();
-            if value as i32 != PIN_UV_AUTH_PROTOCOL_PQC.into() {
-                return Err(CTAP2_ERR_PIN_AUTH_INVALID);
-            }
+            Self::ensure_supported_pin_uv_protocol(value)?;
             if pin_uv_auth_param.len() != 16 && pin_uv_auth_param.len() != 32 {
                 return Err(CTAP2_ERR_PIN_AUTH_INVALID);
             }
@@ -1022,16 +1455,11 @@ where
             }
         }
 
-        let pin_protocol = match Self::map_get(&map, Value::Integer(Integer::from(7))) {
-            Some(Value::Integer(int)) => {
-                let value: i128 = int.clone().into();
-                value as i32
-            }
-            _ => return Err(CTAP2_ERR_MISSING_PARAMETER),
-        };
-
-        if pin_protocol != PIN_UV_AUTH_PROTOCOL_PQC.into() {
-            return Err(CTAP2_ERR_PIN_AUTH_INVALID);
+        if let Some(Value::Integer(int)) = Self::map_get(&map, Value::Integer(Integer::from(7))) {
+            let value: i128 = int.clone().into();
+            Self::ensure_supported_pin_uv_protocol(value)?;
+        } else {
+            return Err(CTAP2_ERR_MISSING_PARAMETER);
         }
 
         let pin_uv_auth_param = match Self::map_get(&map, Value::Integer(Integer::from(6))) {
