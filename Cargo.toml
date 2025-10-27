@@ -1,0 +1,9 @@
+[workspace]
+members = [
+    "trussed-mldsa",
+    "authenticator",
+    "runner",
+    "ml-kem"
+]
+
+resolver = "2"
