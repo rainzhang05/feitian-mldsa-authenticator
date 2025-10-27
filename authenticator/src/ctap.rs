@@ -868,12 +868,53 @@ where
             }
         }
 
-        if let Some(protocol) = Self::map_get(&map, Value::Integer(Integer::from(9))) {
-            let Value::Integer(int) = protocol else {
-                return Err(CTAP2_ERR_INVALID_CBOR);
-            };
-            let value: i128 = int.clone().into();
+        let pin_uv_auth_param = match Self::map_get(&map, Value::Integer(Integer::from(8))) {
+            Some(Value::Bytes(bytes)) => Some(bytes.clone()),
+            Some(_) => return Err(CTAP2_ERR_INVALID_CBOR),
+            None => None,
+        };
+
+        let pin_uv_auth_protocol = match Self::map_get(&map, Value::Integer(Integer::from(9))) {
+            Some(Value::Integer(int)) => Some(int.clone()),
+            Some(_) => return Err(CTAP2_ERR_INVALID_CBOR),
+            None => None,
+        };
+
+        if pin_uv_auth_param.is_some() != pin_uv_auth_protocol.is_some() {
+            return Err(CTAP2_ERR_PIN_AUTH_INVALID);
+        }
+
+        if uv_requested && pin_uv_auth_param.is_some() {
+            return Err(CTAP2_ERR_INVALID_OPTION);
+        }
+
+        let mut uv_verified = false;
+
+        if let (Some(pin_uv_auth_param), Some(protocol)) =
+            (pin_uv_auth_param.as_ref(), pin_uv_auth_protocol)
+        {
+            let value: i128 = protocol.into();
             if value as i32 != PIN_UV_AUTH_PROTOCOL_PQC.into() {
+                return Err(CTAP2_ERR_PIN_AUTH_INVALID);
+            }
+            if pin_uv_auth_param.len() != 16 && pin_uv_auth_param.len() != 32 {
+                return Err(CTAP2_ERR_PIN_AUTH_INVALID);
+            }
+
+            let mut token = self
+                .pin_state
+                .pin_uv_auth_token()
+                .ok_or(CTAP2_ERR_PIN_AUTH_INVALID)?;
+            let mut mac = HmacSha256::new_from_slice(&token).map_err(|_| CTAP2_ERR_PROCESSING)?;
+            mac.update(&client_hash);
+            let computed = mac.finalize().into_bytes();
+            uv_verified = match pin_uv_auth_param.len() {
+                16 => computed[..16] == pin_uv_auth_param[..],
+                32 => computed[..32] == pin_uv_auth_param[..],
+                _ => false,
+            };
+            token.zeroize();
+            if !uv_verified {
                 return Err(CTAP2_ERR_PIN_AUTH_INVALID);
             }
         }
@@ -897,9 +938,13 @@ where
         });
         self.save_credentials(&credentials)?;
 
-        let uv = uv_requested;
-        let auth_data =
-            self.attested_auth_data(&rp_id, &credential_id, &cose_key, uv, initial_sign_count);
+        let auth_data = self.attested_auth_data(
+            &rp_id,
+            &credential_id,
+            &cose_key,
+            uv_verified,
+            initial_sign_count,
+        );
         let signature = sign_challenge(alg, &secret_key, &auth_data, &client_hash);
         let att_stmt = Value::Map(vec![
             (
