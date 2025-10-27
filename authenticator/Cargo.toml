@@ -15,6 +15,7 @@ littlefs2 = "0.4"
 aes-gcm = "0.10"
 hkdf = "0.12"
 sha2 = "0.10"
+hmac = "0.12"
 zeroize = { version = "1", features = ["zeroize_derive"] }
 serde = { version = "1", features = ["derive"] }
 ctaphid-app = "0.1"

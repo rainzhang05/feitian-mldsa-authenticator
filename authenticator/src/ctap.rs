@@ -1,4 +1,7 @@
-use crate::{create_credential, sign_challenge, CoseAlg, PIN_UV_AUTH_PROTOCOL_PQC};
+use crate::{
+    create_credential, decrypt_pin_block, derive_pin_uv_session_keys, encrypt_pin_block,
+    sign_challenge, CoseAlg, PinUvSessionKeys, PIN_UV_AUTH_PROTOCOL_PQC,
+};
 
 use ciborium::{
     de::from_reader,
@@ -6,6 +9,7 @@ use ciborium::{
     value::{Integer, Value},
 };
 use ctaphid_app::{App, Command, Error};
+use hmac::{Hmac, Mac};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use trussed::{
@@ -13,12 +17,15 @@ use trussed::{
     syscall, try_syscall,
     types::{Location, Message, PathBuf},
 };
+use trussed_mlkem::{self, Ciphertext, ParamSet as KemParamSet, SecretKey as KemSecretKey};
+use zeroize::Zeroize;
 
 use trussed_mldsa::SecretKey;
 
 const CTAP_CMD_MAKE_CREDENTIAL: u8 = 0x01;
 const CTAP_CMD_GET_ASSERTION: u8 = 0x02;
 const CTAP_CMD_GET_INFO: u8 = 0x04;
+const CTAP_CMD_CLIENT_PIN: u8 = 0x06;
 
 const CTAP2_OK: u8 = 0x00;
 const CTAP2_ERR_INVALID_CBOR: u8 = 0x12;
@@ -27,8 +34,19 @@ const CTAP2_ERR_CREDENTIAL_EXCLUDED: u8 = 0x19;
 const CTAP2_ERR_UNSUPPORTED_ALGORITHM: u8 = 0x26;
 const CTAP2_ERR_INVALID_OPTION: u8 = 0x2C;
 const CTAP2_ERR_NO_CREDENTIALS: u8 = 0x2E;
+const CTAP1_ERR_INVALID_PARAMETER: u8 = 0x2D;
+const CTAP2_ERR_PIN_INVALID: u8 = 0x31;
+const CTAP2_ERR_PIN_BLOCKED: u8 = 0x32;
 const CTAP2_ERR_PIN_AUTH_INVALID: u8 = 0x33;
+const CTAP2_ERR_PIN_AUTH_BLOCKED: u8 = 0x34;
+const CTAP2_ERR_PIN_NOT_SET: u8 = 0x35;
+const CTAP2_ERR_PIN_POLICY_VIOLATION: u8 = 0x37;
 const CTAP2_ERR_PROCESSING: u8 = 0x21;
+
+const MAX_PIN_RETRIES: u8 = 8;
+const MAX_PIN_FAILURES_BEFORE_BLOCK: u8 = 3;
+
+type HmacSha256 = Hmac<Sha256>;
 
 const CREDENTIAL_STORE_PATH: &str = "credentials.cbor";
 
@@ -45,14 +63,212 @@ struct StoredCredential {
     sign_count: u32,
 }
 
+#[derive(Debug)]
+struct PinState {
+    pin_hash: Option<[u8; 16]>,
+    pin_retries: u8,
+    consecutive_failures: u8,
+}
+
+impl PinState {
+    const MIN_PIN_LENGTH: usize = 4;
+
+    fn new() -> Self {
+        Self {
+            pin_hash: None,
+            pin_retries: MAX_PIN_RETRIES,
+            consecutive_failures: 0,
+        }
+    }
+
+    fn is_set(&self) -> bool {
+        self.pin_hash.is_some()
+    }
+
+    fn set_pin(&mut self, hash: [u8; 16]) {
+        self.pin_hash = Some(hash);
+        self.pin_retries = MAX_PIN_RETRIES;
+        self.consecutive_failures = 0;
+    }
+
+    fn retries(&self) -> u8 {
+        self.pin_retries
+    }
+
+    fn verify_pin_hash(&mut self, candidate: &[u8; 16]) -> Result<(), u8> {
+        let Some(stored) = self.pin_hash else {
+            return Err(CTAP2_ERR_PIN_NOT_SET);
+        };
+        if stored == *candidate {
+            self.pin_retries = MAX_PIN_RETRIES;
+            self.consecutive_failures = 0;
+            Ok(())
+        } else {
+            if self.pin_retries > 0 {
+                self.pin_retries -= 1;
+            }
+            if self.pin_retries == 0 {
+                return Err(CTAP2_ERR_PIN_BLOCKED);
+            }
+            self.consecutive_failures = self
+                .consecutive_failures
+                .saturating_add(1)
+                .min(MAX_PIN_FAILURES_BEFORE_BLOCK);
+            if self.consecutive_failures >= MAX_PIN_FAILURES_BEFORE_BLOCK {
+                Err(CTAP2_ERR_PIN_AUTH_BLOCKED)
+            } else {
+                Err(CTAP2_ERR_PIN_INVALID)
+            }
+        }
+    }
+}
+
+#[derive(PartialEq, Eq)]
+enum PinProtocol {
+    Pqc,
+    Classic,
+}
+
+enum PinProtocolSession {
+    Pqc {
+        param_set: KemParamSet,
+        secret_key: KemSecretKey,
+        public_key: Vec<u8>,
+    },
+    Classic {
+        public_key: Vec<u8>,
+        secret_material: [u8; 32],
+    },
+}
+
+impl PinProtocolSession {
+    fn protocol(&self) -> PinProtocol {
+        match self {
+            PinProtocolSession::Pqc { .. } => PinProtocol::Pqc,
+            PinProtocolSession::Classic { .. } => PinProtocol::Classic,
+        }
+    }
+
+    fn key_agreement_value(&self) -> Value {
+        match self {
+            PinProtocolSession::Pqc { public_key, .. } => Value::Map(vec![
+                (
+                    Value::Integer(Integer::from(1)),
+                    Value::Integer(Integer::from(1)),
+                ),
+                (
+                    Value::Integer(Integer::from(3)),
+                    Value::Integer(Integer::from(-101)),
+                ),
+                (
+                    Value::Integer(Integer::from(-1)),
+                    Value::Integer(Integer::from(512)),
+                ),
+                (
+                    Value::Integer(Integer::from(-2)),
+                    Value::Bytes(public_key.clone()),
+                ),
+            ]),
+            PinProtocolSession::Classic { public_key, .. } => Value::Map(vec![
+                (
+                    Value::Integer(Integer::from(1)),
+                    Value::Integer(Integer::from(2)),
+                ),
+                (
+                    Value::Integer(Integer::from(3)),
+                    Value::Integer(Integer::from(-25)),
+                ),
+                (
+                    Value::Integer(Integer::from(-1)),
+                    Value::Integer(Integer::from(256)),
+                ),
+                (
+                    Value::Integer(Integer::from(-2)),
+                    Value::Bytes(public_key.clone()),
+                ),
+            ]),
+        }
+    }
+
+    fn derive_session_keys(
+        self,
+        platform_key: &[(Value, Value)],
+    ) -> Result<(PinUvSessionKeys, Vec<u8>), u8> {
+        match self {
+            PinProtocolSession::Pqc {
+                param_set,
+                secret_key,
+                public_key,
+            } => {
+                let Some(ciphertext_bytes) = platform_key
+                    .iter()
+                    .find(|(k, _)| *k == Value::Integer(Integer::from(-2)))
+                    .and_then(|(_, v)| match v {
+                        Value::Bytes(bytes) => Some(bytes.clone()),
+                        _ => None,
+                    })
+                else {
+                    return Err(CTAP1_ERR_INVALID_PARAMETER);
+                };
+                let ciphertext = Ciphertext(ciphertext_bytes.clone());
+                let shared = trussed_mlkem::decapsulate(param_set, &secret_key, &ciphertext);
+                let mut hasher = Sha256::new();
+                hasher.update(&public_key);
+                hasher.update(&ciphertext_bytes);
+                let transcript_hash = hasher.finalize().to_vec();
+                let keys = derive_pin_uv_session_keys(&shared.0, &transcript_hash);
+                Ok((keys, transcript_hash))
+            }
+            PinProtocolSession::Classic {
+                public_key,
+                mut secret_material,
+            } => {
+                let Some(peer_bytes) = platform_key
+                    .iter()
+                    .find(|(k, _)| *k == Value::Integer(Integer::from(-2)))
+                    .and_then(|(_, v)| match v {
+                        Value::Bytes(bytes) => Some(bytes.clone()),
+                        _ => None,
+                    })
+                else {
+                    secret_material.zeroize();
+                    return Err(CTAP1_ERR_INVALID_PARAMETER);
+                };
+                let mut hasher = Sha256::new();
+                hasher.update(&public_key);
+                hasher.update(&peer_bytes);
+                let transcript_hash = hasher.finalize().to_vec();
+
+                let mut secret_hasher = Sha256::new();
+                secret_hasher.update(&secret_material);
+                secret_hasher.update(&peer_bytes);
+                secret_material.zeroize();
+                let shared = secret_hasher.finalize();
+                let shared_bytes: [u8; 32] = shared.into();
+                let keys = derive_pin_uv_session_keys(&shared_bytes, &transcript_hash);
+                Ok((keys, transcript_hash))
+            }
+        }
+    }
+}
+
 pub struct CtapApp<C> {
     client: C,
     aaguid: [u8; 16],
+    pin_state: PinState,
+    pin_protocol_session: Option<PinProtocolSession>,
+    platform_declined_pqc: bool,
 }
 
 impl<C> CtapApp<C> {
     pub fn new(client: C, aaguid: [u8; 16]) -> Self {
-        Self { client, aaguid }
+        Self {
+            client,
+            aaguid,
+            pin_state: PinState::new(),
+            pin_protocol_session: None,
+            platform_declined_pqc: false,
+        }
     }
 }
 
@@ -60,6 +276,291 @@ impl<C> CtapApp<C>
 where
     C: TrussedClient + FilesystemClient + CryptoClient,
 {
+    fn verify_pin_auth(keys: &PinUvSessionKeys, data: &[u8], provided: &[u8]) -> Result<(), u8> {
+        let mut mac =
+            HmacSha256::new_from_slice(&keys.auth_key).map_err(|_| CTAP2_ERR_PROCESSING)?;
+        mac.update(data);
+        let result = mac.finalize().into_bytes();
+        if provided.len() != 16 {
+            return Err(CTAP2_ERR_PIN_AUTH_INVALID);
+        }
+        if result[..16] == provided[..16] {
+            Ok(())
+        } else {
+            Err(CTAP2_ERR_PIN_AUTH_INVALID)
+        }
+    }
+
+    fn decrypt_pin_block_checked(
+        keys: &PinUvSessionKeys,
+        transcript_hash: &[u8],
+        ciphertext: &[u8],
+    ) -> Result<Vec<u8>, u8> {
+        if ciphertext.len() < 16 {
+            return Err(CTAP1_ERR_INVALID_PARAMETER);
+        }
+        let nonce = [0u8; 12];
+        decrypt_pin_block(keys, &nonce, ciphertext, transcript_hash)
+            .map_err(|_| CTAP2_ERR_PIN_AUTH_INVALID)
+    }
+
+    fn extract_new_pin(plaintext: &mut [u8]) -> Result<Vec<u8>, u8> {
+        if plaintext.len() != 64 {
+            return Err(CTAP1_ERR_INVALID_PARAMETER);
+        }
+        let mut end = plaintext.len();
+        while end > 0 && plaintext[end - 1] == 0 {
+            end -= 1;
+        }
+        let pin = plaintext[..end].to_vec();
+        plaintext.zeroize();
+        if pin.len() < PinState::MIN_PIN_LENGTH {
+            return Err(CTAP2_ERR_PIN_POLICY_VIOLATION);
+        }
+        if pin.len() > 63 {
+            return Err(CTAP2_ERR_PIN_POLICY_VIOLATION);
+        }
+        Ok(pin)
+    }
+
+    fn hash_pin(pin: &[u8]) -> [u8; 16] {
+        let mut hasher = Sha256::new();
+        hasher.update(pin);
+        let digest = hasher.finalize();
+        let mut out = [0u8; 16];
+        out.copy_from_slice(&digest[..16]);
+        out
+    }
+
+    fn as_array<const N: usize>(bytes: &[u8]) -> Result<[u8; N], u8> {
+        if bytes.len() != N {
+            return Err(CTAP1_ERR_INVALID_PARAMETER);
+        }
+        let mut array = [0u8; N];
+        array.copy_from_slice(bytes);
+        Ok(array)
+    }
+
+    fn requested_pin_protocol(&mut self, map: &[(Value, Value)]) -> Result<PinProtocol, u8> {
+        if let Some(Value::Integer(int)) = Self::map_get(map, Value::Integer(Integer::from(1))) {
+            let value: i128 = int.clone().into();
+            match value {
+                v if v == i128::from(PIN_UV_AUTH_PROTOCOL_PQC) => {
+                    self.platform_declined_pqc = false;
+                    Ok(PinProtocol::Pqc)
+                }
+                2 => {
+                    self.platform_declined_pqc = true;
+                    Ok(PinProtocol::Classic)
+                }
+                _ => Err(CTAP1_ERR_INVALID_PARAMETER),
+            }
+        } else if self.platform_declined_pqc {
+            Ok(PinProtocol::Classic)
+        } else {
+            Ok(PinProtocol::Pqc)
+        }
+    }
+
+    fn take_session(&mut self, protocol: PinProtocol) -> Result<PinProtocolSession, u8> {
+        match self.pin_protocol_session.take() {
+            Some(session) if session.protocol() == protocol => Ok(session),
+            Some(session) => {
+                self.pin_protocol_session = Some(session);
+                Err(CTAP2_ERR_PIN_AUTH_INVALID)
+            }
+            None => Err(CTAP2_ERR_PIN_AUTH_INVALID),
+        }
+    }
+
+    fn client_pin_get_key_agreement(&mut self, protocol: PinProtocol) -> Result<Vec<u8>, u8> {
+        let session = match protocol {
+            PinProtocol::Pqc => {
+                let param_set = KemParamSet::MLKem512;
+                let (public_key, secret_key) = trussed_mlkem::keypair(param_set);
+                PinProtocolSession::Pqc {
+                    param_set,
+                    secret_key,
+                    public_key: public_key.0.clone(),
+                }
+            }
+            PinProtocol::Classic => {
+                let bytes = syscall!(self.client.random_bytes(32)).bytes;
+                let mut secret = [0u8; 32];
+                secret.copy_from_slice(bytes.as_slice());
+                PinProtocolSession::Classic {
+                    public_key: bytes.to_vec(),
+                    secret_material: secret,
+                }
+            }
+        };
+        let key_map = session.key_agreement_value();
+        self.pin_protocol_session = Some(session);
+        let response = Value::Map(vec![(Value::Integer(Integer::from(1)), key_map)]);
+        let mut encoded = Vec::new();
+        into_writer(&response, &mut encoded).map_err(|_| CTAP2_ERR_PROCESSING)?;
+        let mut out = Vec::with_capacity(1 + encoded.len());
+        out.push(CTAP2_OK);
+        out.extend_from_slice(&encoded);
+        Ok(out)
+    }
+
+    fn client_pin_set_pin(
+        &mut self,
+        protocol: PinProtocol,
+        map: &[(Value, Value)],
+    ) -> Result<Vec<u8>, u8> {
+        if self.pin_state.is_set() {
+            return Err(CTAP2_ERR_PIN_AUTH_INVALID);
+        }
+        let key_agreement = match Self::map_get(map, Value::Integer(Integer::from(3))) {
+            Some(Value::Map(entries)) => entries,
+            _ => return Err(CTAP2_ERR_MISSING_PARAMETER),
+        };
+        let new_pin_enc = match Self::map_get(map, Value::Integer(Integer::from(5))) {
+            Some(Value::Bytes(bytes)) => bytes.clone(),
+            _ => return Err(CTAP2_ERR_MISSING_PARAMETER),
+        };
+        let pin_auth_param = match Self::map_get(map, Value::Integer(Integer::from(4))) {
+            Some(Value::Bytes(bytes)) => bytes.clone(),
+            _ => return Err(CTAP2_ERR_MISSING_PARAMETER),
+        };
+
+        let session = self.take_session(protocol)?;
+        let (keys, transcript_hash) = session.derive_session_keys(key_agreement)?;
+        Self::verify_pin_auth(&keys, &new_pin_enc, &pin_auth_param)?;
+        let mut plaintext = Self::decrypt_pin_block_checked(&keys, &transcript_hash, &new_pin_enc)?;
+        let mut new_pin = Self::extract_new_pin(&mut plaintext)?;
+        let hash = Self::hash_pin(&new_pin);
+        new_pin.zeroize();
+        self.pin_state.set_pin(hash);
+        Ok(vec![CTAP2_OK])
+    }
+
+    fn client_pin_change_pin(
+        &mut self,
+        protocol: PinProtocol,
+        map: &[(Value, Value)],
+    ) -> Result<Vec<u8>, u8> {
+        if !self.pin_state.is_set() {
+            return Err(CTAP2_ERR_PIN_NOT_SET);
+        }
+        let key_agreement = match Self::map_get(map, Value::Integer(Integer::from(3))) {
+            Some(Value::Map(entries)) => entries,
+            _ => return Err(CTAP2_ERR_MISSING_PARAMETER),
+        };
+        let new_pin_enc = match Self::map_get(map, Value::Integer(Integer::from(5))) {
+            Some(Value::Bytes(bytes)) => bytes.clone(),
+            _ => return Err(CTAP2_ERR_MISSING_PARAMETER),
+        };
+        let pin_hash_enc = match Self::map_get(map, Value::Integer(Integer::from(6))) {
+            Some(Value::Bytes(bytes)) => bytes.clone(),
+            _ => return Err(CTAP2_ERR_MISSING_PARAMETER),
+        };
+        let pin_auth_param = match Self::map_get(map, Value::Integer(Integer::from(4))) {
+            Some(Value::Bytes(bytes)) => bytes.clone(),
+            _ => return Err(CTAP2_ERR_MISSING_PARAMETER),
+        };
+
+        let session = self.take_session(protocol)?;
+        let (keys, transcript_hash) = session.derive_session_keys(key_agreement)?;
+        let mut auth_data = Vec::with_capacity(new_pin_enc.len() + pin_hash_enc.len());
+        auth_data.extend_from_slice(&new_pin_enc);
+        auth_data.extend_from_slice(&pin_hash_enc);
+        Self::verify_pin_auth(&keys, &auth_data, &pin_auth_param)?;
+
+        let mut current_plain =
+            Self::decrypt_pin_block_checked(&keys, &transcript_hash, &pin_hash_enc)?;
+        let current_hash = Self::as_array::<16>(&current_plain)?;
+        current_plain.zeroize();
+        if let Err(err) = self.pin_state.verify_pin_hash(&current_hash) {
+            return Err(err);
+        }
+
+        let mut new_pin_plain =
+            Self::decrypt_pin_block_checked(&keys, &transcript_hash, &new_pin_enc)?;
+        let mut new_pin = Self::extract_new_pin(&mut new_pin_plain)?;
+        let hash = Self::hash_pin(&new_pin);
+        new_pin.zeroize();
+        self.pin_state.set_pin(hash);
+        Ok(vec![CTAP2_OK])
+    }
+
+    fn client_pin_get_token(
+        &mut self,
+        protocol: PinProtocol,
+        map: &[(Value, Value)],
+    ) -> Result<Vec<u8>, u8> {
+        if !self.pin_state.is_set() {
+            return Err(CTAP2_ERR_PIN_NOT_SET);
+        }
+        let key_agreement = match Self::map_get(map, Value::Integer(Integer::from(3))) {
+            Some(Value::Map(entries)) => entries,
+            _ => return Err(CTAP2_ERR_MISSING_PARAMETER),
+        };
+        let pin_hash_enc = match Self::map_get(map, Value::Integer(Integer::from(6))) {
+            Some(Value::Bytes(bytes)) => bytes.clone(),
+            _ => return Err(CTAP2_ERR_MISSING_PARAMETER),
+        };
+        let pin_auth_param = match Self::map_get(map, Value::Integer(Integer::from(4))) {
+            Some(Value::Bytes(bytes)) => bytes.clone(),
+            _ => return Err(CTAP2_ERR_MISSING_PARAMETER),
+        };
+
+        let session = self.take_session(protocol)?;
+        let (keys, transcript_hash) = session.derive_session_keys(key_agreement)?;
+        Self::verify_pin_auth(&keys, &pin_hash_enc, &pin_auth_param)?;
+
+        let mut plain = Self::decrypt_pin_block_checked(&keys, &transcript_hash, &pin_hash_enc)?;
+        let current_hash = Self::as_array::<16>(&plain)?;
+        plain.zeroize();
+        if let Err(err) = self.pin_state.verify_pin_hash(&current_hash) {
+            return Err(err);
+        }
+
+        let random = syscall!(self.client.random_bytes(32)).bytes;
+        let mut token = random.to_vec();
+        let nonce = [0u8; 12];
+        let encrypted = encrypt_pin_block(&keys, &nonce, &token, &transcript_hash);
+        token.zeroize();
+        let response = Value::Map(vec![
+            (Value::Integer(Integer::from(2)), Value::Bytes(encrypted)),
+            (
+                Value::Integer(Integer::from(3)),
+                Value::Integer(Integer::from(u64::from(self.pin_state.retries()))),
+            ),
+        ]);
+        let mut encoded = Vec::new();
+        into_writer(&response, &mut encoded).map_err(|_| CTAP2_ERR_PROCESSING)?;
+        let mut out = Vec::with_capacity(1 + encoded.len());
+        out.push(CTAP2_OK);
+        out.extend_from_slice(&encoded);
+        Ok(out)
+    }
+
+    fn handle_client_pin(&mut self, payload: &[u8]) -> Result<Vec<u8>, u8> {
+        let request: Value = from_reader(payload).map_err(|_| CTAP2_ERR_INVALID_CBOR)?;
+        let map = match request {
+            Value::Map(map) => map,
+            _ => return Err(CTAP2_ERR_INVALID_CBOR),
+        };
+        let subcommand = match Self::map_get(&map, Value::Integer(Integer::from(2))) {
+            Some(Value::Integer(int)) => {
+                let value: i128 = int.clone().into();
+                value as u8
+            }
+            _ => return Err(CTAP2_ERR_MISSING_PARAMETER),
+        };
+        let protocol = self.requested_pin_protocol(&map)?;
+        match subcommand {
+            0x02 => self.client_pin_get_key_agreement(protocol),
+            0x03 => self.client_pin_set_pin(protocol, &map),
+            0x04 => self.client_pin_change_pin(protocol, &map),
+            0x05 | 0x09 => self.client_pin_get_token(protocol, &map),
+            _ => Err(CTAP1_ERR_INVALID_PARAMETER),
+        }
+    }
+
     fn store_path() -> Result<PathBuf, u8> {
         PathBuf::try_from(CREDENTIAL_STORE_PATH).map_err(|_| CTAP2_ERR_PROCESSING)
     }
@@ -155,6 +656,7 @@ where
             (Value::Text("uv".into()), Value::Bool(true)),
             (Value::Text("up".into()), Value::Bool(true)),
             (Value::Text("pinUvAuthToken".into()), Value::Bool(true)),
+            (Value::Text("clientPin".into()), Value::Bool(true)),
         ]);
         map.push((Value::Integer(Integer::from(4)), options));
 
@@ -165,14 +667,20 @@ where
 
         map.push((
             Value::Integer(Integer::from(6)),
-            Value::Array(vec![Value::Integer(Integer::from(i32::from(
-                PIN_UV_AUTH_PROTOCOL_PQC,
-            )))]),
+            Value::Array(vec![
+                Value::Integer(Integer::from(i32::from(PIN_UV_AUTH_PROTOCOL_PQC))),
+                Value::Integer(Integer::from(2)),
+            ]),
         ));
 
         map.push((
             Value::Integer(Integer::from(8)),
             Value::Integer(Integer::from(128)),
+        ));
+
+        map.push((
+            Value::Integer(Integer::from(13)),
+            Value::Integer(Integer::from(PinState::MIN_PIN_LENGTH as u64)),
         ));
 
         let algorithms = [-48, -49, -50]
@@ -505,6 +1013,7 @@ where
                     CTAP_CMD_GET_INFO => self.handle_get_info(),
                     CTAP_CMD_MAKE_CREDENTIAL => self.handle_make_credential(payload),
                     CTAP_CMD_GET_ASSERTION => self.handle_get_assertion(payload),
+                    CTAP_CMD_CLIENT_PIN => self.handle_client_pin(payload),
                     _ => Err(CTAP2_ERR_INVALID_CBOR),
                 };
 
