@@ -1,0 +1,17 @@
+[package]
+name = "trussed-mlkem"
+version = "0.1.0"
+edition = "2021"
+
+description = "Safe Rust wrapper around the liboqs ML-KEM key encapsulation mechanisms"
+authors = ["Your Name <you@example.com>"]
+license = "Apache-2.0 OR MIT"
+
+[dependencies]
+zeroize = { version = "1", features = ["zeroize_derive"] }
+
+[features]
+default = ["mlkem512", "mlkem768", "mlkem1024"]
+mlkem512 = []
+mlkem768 = []
+mlkem1024 = []
