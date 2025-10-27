@@ -35,6 +35,8 @@ use sha2::Sha256;
 use trussed_mldsa::{keypair, sign, ParamSet, PublicKey, SecretKey};
 use zeroize::Zeroize;
 
+pub mod ctap;
+
 /// Identifier advertised in `authenticatorGetInfo` for the PQC PIN/UV protocol.
 pub const PIN_UV_AUTH_PROTOCOL_PQC: u8 = 101;
 

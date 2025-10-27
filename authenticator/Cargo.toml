@@ -16,6 +16,9 @@ aes-gcm = "0.10"
 hkdf = "0.12"
 sha2 = "0.10"
 zeroize = { version = "1", features = ["zeroize_derive"] }
+serde = { version = "1", features = ["derive"] }
+ctaphid-app = "0.1"
+heapless-bytes = "0.3"
 
 # Use our local wrapper for ML‑DSA.  By enabling all parameter set features the
 # wrapper links to the stub C implementation for 44/65/87.
