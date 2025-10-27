@@ -68,7 +68,6 @@ fn main() {
     if !lib_dir.exists() {
         panic!("liboqs lib directory missing: {}", lib_dir.display());
     }
-
     let (link_target, kind) = select_library(&lib_dir);
     match kind {
         LibraryKind::Static => {
@@ -88,9 +87,9 @@ fn main() {
         }
     }
 
-    ensure_symbol(&link_target, "OQS_SIG_ml_dsa_44_sign");
-    ensure_symbol(&link_target, "OQS_SIG_ml_dsa_65_sign");
-    ensure_symbol(&link_target, "OQS_SIG_ml_dsa_87_sign");
+    ensure_symbol(&link_target, "OQS_KEM_ml_kem_512_decaps");
+    ensure_symbol(&link_target, "OQS_KEM_ml_kem_768_decaps");
+    ensure_symbol(&link_target, "OQS_KEM_ml_kem_1024_decaps");
 
     let include_dir = include_directory(&root);
     let config = include_dir.join("oqs/oqsconfig.h");

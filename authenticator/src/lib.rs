@@ -25,9 +25,88 @@
 //! * Construct a COSE_Key for the public key using CBOR encoding.
 //! * Sign a challenge using the selected parameter set.
 //!
+#[allow(deprecated)]
+use aes_gcm::aead::{generic_array::GenericArray, Aead, KeyInit, Payload};
+use aes_gcm::Aes256Gcm;
 use ciborium::ser::into_writer;
 use ciborium::value::{Integer, Value};
+use hkdf::Hkdf;
+use sha2::Sha256;
 use trussed_mldsa::{keypair, sign, ParamSet, PublicKey, SecretKey};
+use zeroize::Zeroize;
+
+/// Identifier advertised in `authenticatorGetInfo` for the PQC PIN/UV protocol.
+pub const PIN_UV_AUTH_PROTOCOL_PQC: u8 = 101;
+
+/// Session keys derived from an ML-KEM shared secret and the transcript hash.
+#[derive(Debug, Zeroize)]
+#[zeroize(drop)]
+pub struct PinUvSessionKeys {
+    pub encryption_key: [u8; 32],
+    pub auth_key: [u8; 32],
+}
+
+/// Derive the AES-256-GCM encryption key and the 32-byte HMAC key used for
+/// client PIN handling.  The HKDF salt binds the keys to the transcript hash.
+pub fn derive_pin_uv_session_keys(
+    shared_secret: &[u8],
+    transcript_hash: &[u8],
+) -> PinUvSessionKeys {
+    let hkdf = Hkdf::<Sha256>::new(Some(transcript_hash), shared_secret);
+    let mut okm = [0u8; 64];
+    hkdf.expand(b"FIDO2-PQC-PIN-KEYS", &mut okm)
+        .expect("HKDF expand must not fail for valid length");
+    let mut encryption_key = [0u8; 32];
+    let mut auth_key = [0u8; 32];
+    encryption_key.copy_from_slice(&okm[..32]);
+    auth_key.copy_from_slice(&okm[32..]);
+    okm.zeroize();
+    PinUvSessionKeys {
+        encryption_key,
+        auth_key,
+    }
+}
+
+/// Encrypt PIN data using AES-256-GCM.  The transcript hash should be supplied
+/// as AAD to bind the ciphertext to the protocol run.
+#[allow(deprecated)]
+pub fn encrypt_pin_block(
+    keys: &PinUvSessionKeys,
+    nonce: &[u8; 12],
+    plaintext: &[u8],
+    transcript_hash: &[u8],
+) -> Vec<u8> {
+    let cipher = Aes256Gcm::new_from_slice(&keys.encryption_key).expect("invalid AES key length");
+    let nonce_ga = GenericArray::clone_from_slice(nonce);
+    cipher
+        .encrypt(
+            &nonce_ga,
+            Payload {
+                msg: plaintext,
+                aad: transcript_hash,
+            },
+        )
+        .expect("encryption should not fail for valid parameters")
+}
+
+/// Decrypt the PIN block using AES-256-GCM and the previously derived keys.
+#[allow(deprecated)]
+pub fn decrypt_pin_block(
+    keys: &PinUvSessionKeys,
+    nonce: &[u8; 12],
+    ciphertext: &[u8],
+    transcript_hash: &[u8],
+) -> Result<Vec<u8>, aes_gcm::Error> {
+    let cipher = Aes256Gcm::new_from_slice(&keys.encryption_key).expect("invalid AES key length");
+    let nonce_ga = GenericArray::clone_from_slice(nonce);
+    cipher.decrypt(
+        &nonce_ga,
+        Payload {
+            msg: ciphertext,
+            aad: transcript_hash,
+        },
+    )
+}
 
 /// Enumeration of COSE algorithm identifiers for ML-DSA.  These values
 /// follow the draft COSE registration; they are negative because COSE
@@ -84,11 +163,23 @@ pub fn cose_public_key(ps: ParamSet, pk: &PublicKey) -> Vec<u8> {
         ParamSet::MLDsa87 => (-50, 87),
     };
     // Build a CBOR map {1:1, 3:alg_id, -1:curve_id, -2:pk_bytes}
-    let mut m = std::collections::BTreeMap::new();
-    m.insert(Value::Integer(Integer::from(1)), Value::Integer(Integer::from(1))); // kty = OKP
-    m.insert(Value::Integer(Integer::from(3)), Value::Integer(Integer::from(alg_id)));
-    m.insert(Value::Integer(Integer::from(-1)), Value::Integer(Integer::from(curve_id)));
-    m.insert(Value::Integer(Integer::from(-2)), Value::Bytes(pk.0.clone()));
+    let mut m = Vec::with_capacity(4);
+    m.push((
+        Value::Integer(Integer::from(1)),
+        Value::Integer(Integer::from(1)),
+    ));
+    m.push((
+        Value::Integer(Integer::from(3)),
+        Value::Integer(Integer::from(alg_id)),
+    ));
+    m.push((
+        Value::Integer(Integer::from(-1)),
+        Value::Integer(Integer::from(curve_id)),
+    ));
+    m.push((
+        Value::Integer(Integer::from(-2)),
+        Value::Bytes(pk.0.clone()),
+    ));
     let mut out = Vec::new();
     into_writer(&Value::Map(m), &mut out).expect("CBOR encoding failed");
     out
@@ -107,7 +198,12 @@ pub fn create_credential(alg: CoseAlg) -> (Vec<u8>, SecretKey) {
 
 /// Produce an ML-DSA signature over `auth_data || client_data_hash` using
 /// the provided secret key.  Returns the raw signature bytes.
-pub fn sign_challenge(alg: CoseAlg, sk: &SecretKey, auth_data: &[u8], client_data_hash: &[u8]) -> Vec<u8> {
+pub fn sign_challenge(
+    alg: CoseAlg,
+    sk: &SecretKey,
+    auth_data: &[u8],
+    client_data_hash: &[u8],
+) -> Vec<u8> {
     let ps = paramset_from_alg(alg);
     let mut msg = Vec::with_capacity(auth_data.len() + client_data_hash.len());
     msg.extend_from_slice(auth_data);
@@ -119,3 +215,58 @@ pub fn sign_challenge(alg: CoseAlg, sk: &SecretKey, auth_data: &[u8], client_dat
 // credential records, persist secrets via Trussed storage, and
 // implement the CTAP2 command handlers.  See the README for links
 // explaining how to integrate this crate into a runner.
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ciborium::value::Integer;
+    use trussed_mldsa::verify;
+    use trussed_mlkem::{self, ParamSet as KemParamSet};
+
+    #[test]
+    fn mldsa_roundtrip_signatures() {
+        for alg in [CoseAlg::MLDSA44, CoseAlg::MLDSA65, CoseAlg::MLDSA87] {
+            let (public_key_cbor, secret_key) = create_credential(alg);
+            assert!(!public_key_cbor.is_empty());
+            let auth_data = b"auth_data";
+            let client_hash = b"client_data_hash";
+            let signature = sign_challenge(alg, &secret_key, auth_data, client_hash);
+            let ps = paramset_from_alg(alg);
+            let message: Vec<u8> = auth_data.iter().chain(client_hash).cloned().collect();
+            let pk = PublicKey(public_key_from_cose(&public_key_cbor));
+            assert!(verify(ps, &pk, &message, &signature));
+        }
+    }
+
+    fn public_key_from_cose(cbor: &[u8]) -> Vec<u8> {
+        let value: ciborium::value::Value = ciborium::de::from_reader(cbor).expect("valid CBOR");
+        if let ciborium::value::Value::Map(map) = value {
+            for (k, v) in map {
+                if k == ciborium::value::Value::Integer(Integer::from(-2)) {
+                    if let ciborium::value::Value::Bytes(bytes) = v {
+                        return bytes;
+                    }
+                }
+            }
+        }
+        panic!("COSE key missing public key bytes");
+    }
+
+    #[test]
+    fn mlkem_pin_protocol_roundtrip() {
+        let (pk, sk) = trussed_mlkem::keypair(KemParamSet::MLKem512);
+        let (ciphertext, shared_secret_client) =
+            trussed_mlkem::encapsulate(KemParamSet::MLKem512, &pk);
+        let shared_secret_auth =
+            trussed_mlkem::decapsulate(KemParamSet::MLKem512, &sk, &ciphertext);
+        let transcript_hash = b"transcript";
+        let client_keys = derive_pin_uv_session_keys(&shared_secret_client.0, transcript_hash);
+        let auth_keys = derive_pin_uv_session_keys(&shared_secret_auth.0, transcript_hash);
+        let nonce = [0u8; 12];
+        let plaintext = b"PIN data";
+        let ciphertext = encrypt_pin_block(&client_keys, &nonce, plaintext, transcript_hash);
+        let decrypted = decrypt_pin_block(&auth_keys, &nonce, &ciphertext, transcript_hash)
+            .expect("decryption should succeed");
+        assert_eq!(plaintext.to_vec(), decrypted);
+    }
+}

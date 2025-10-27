@@ -12,7 +12,12 @@ trussed = "0.1.0"
 ciborium = { version = "0.2", default-features = false }
 heapless = "0.7"
 littlefs2 = "0.4"
+aes-gcm = "0.10"
+hkdf = "0.12"
+sha2 = "0.10"
+zeroize = { version = "1", features = ["zeroize_derive"] }
 
 # Use our local wrapper for ML‑DSA.  By enabling all parameter set features the
 # wrapper links to the stub C implementation for 44/65/87.
 trussed-mldsa = { path = "../trussed-mldsa", features = ["mldsa44", "mldsa65", "mldsa87"] }
+trussed-mlkem = { path = "../trussed-mlkem", features = ["mlkem512", "mlkem768", "mlkem1024"] }

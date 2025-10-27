@@ -1,71 +1,83 @@
-//! Safe Rust wrapper around the C ML‑DSA stub implementation.
+//! Safe Rust wrapper around the liboqs ML-DSA signature implementations.
 //!
-//! The C functions defined in `mldsa-native/mldsa.c` provide simple
-//! parameterized key generation and signing for the ML‑DSA signature
-//! scheme.  They do **not** implement the actual ML‑DSA algorithm but
-//! instead fill keys and signatures with pseudo‑random bytes.  Use
-//! [`ParamSet`] to select the desired parameter set.
+//! The wrapper exposes the ML-DSA-44/65/87 variants with minimal
+//! overhead while ensuring that secret keys are wiped from memory on
+//! drop.  The FFI bindings panic when liboqs reports an error, which is
+//! desirable for development builds where failing to produce a
+//! signature should abort the test suite immediately.
 
-use core::ffi::c_int;
-use core::ptr;
 use zeroize::Zeroize;
 
 #[cfg(feature = "mldsa44")]
 extern "C" {
-    fn mldsa44_sizes(pk_len: *mut usize, sk_len: *mut usize, sig_len: *mut usize) -> c_int;
-    fn mldsa44_keypair(pk: *mut u8, sk: *mut u8) -> c_int;
-    fn mldsa44_sign(
-        sig: *mut u8,
-        sig_len: *mut usize,
-        msg: *const u8,
-        msg_len: usize,
-        sk: *const u8,
-    ) -> c_int;
+    fn OQS_SIG_ml_dsa_44_keypair(public_key: *mut u8, secret_key: *mut u8) -> i32;
+    fn OQS_SIG_ml_dsa_44_sign(
+        signature: *mut u8,
+        signature_len: *mut usize,
+        message: *const u8,
+        message_len: usize,
+        secret_key: *const u8,
+    ) -> i32;
+    fn OQS_SIG_ml_dsa_44_verify(
+        message: *const u8,
+        message_len: usize,
+        signature: *const u8,
+        signature_len: usize,
+        public_key: *const u8,
+    ) -> i32;
 }
 
 #[cfg(feature = "mldsa65")]
 extern "C" {
-    fn mldsa65_sizes(pk_len: *mut usize, sk_len: *mut usize, sig_len: *mut usize) -> c_int;
-    fn mldsa65_keypair(pk: *mut u8, sk: *mut u8) -> c_int;
-    fn mldsa65_sign(
-        sig: *mut u8,
-        sig_len: *mut usize,
-        msg: *const u8,
-        msg_len: usize,
-        sk: *const u8,
-    ) -> c_int;
+    fn OQS_SIG_ml_dsa_65_keypair(public_key: *mut u8, secret_key: *mut u8) -> i32;
+    fn OQS_SIG_ml_dsa_65_sign(
+        signature: *mut u8,
+        signature_len: *mut usize,
+        message: *const u8,
+        message_len: usize,
+        secret_key: *const u8,
+    ) -> i32;
+    fn OQS_SIG_ml_dsa_65_verify(
+        message: *const u8,
+        message_len: usize,
+        signature: *const u8,
+        signature_len: usize,
+        public_key: *const u8,
+    ) -> i32;
 }
 
 #[cfg(feature = "mldsa87")]
 extern "C" {
-    fn mldsa87_sizes(pk_len: *mut usize, sk_len: *mut usize, sig_len: *mut usize) -> c_int;
-    fn mldsa87_keypair(pk: *mut u8, sk: *mut u8) -> c_int;
-    fn mldsa87_sign(
-        sig: *mut u8,
-        sig_len: *mut usize,
-        msg: *const u8,
-        msg_len: usize,
-        sk: *const u8,
-    ) -> c_int;
+    fn OQS_SIG_ml_dsa_87_keypair(public_key: *mut u8, secret_key: *mut u8) -> i32;
+    fn OQS_SIG_ml_dsa_87_sign(
+        signature: *mut u8,
+        signature_len: *mut usize,
+        message: *const u8,
+        message_len: usize,
+        secret_key: *const u8,
+    ) -> i32;
+    fn OQS_SIG_ml_dsa_87_verify(
+        message: *const u8,
+        message_len: usize,
+        signature: *const u8,
+        signature_len: usize,
+        public_key: *const u8,
+    ) -> i32;
 }
 
-/// ML‑DSA parameter set.
+/// ML-DSA parameter sets supported by this wrapper.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ParamSet {
-    /// Parameter set ML‑DSA‑44 (security level 2).
     MLDsa44,
-    /// Parameter set ML‑DSA‑65 (security level 3).
     MLDsa65,
-    /// Parameter set ML‑DSA‑87 (security level 5).
     MLDsa87,
 }
 
-/// Public key wrapper.  The bytes can be accessed via `.0`.  Note that
-/// the underlying C code uses raw bytes; no structure is imposed here.
+/// Public key wrapper.
 #[derive(Debug, Clone)]
 pub struct PublicKey(pub Vec<u8>);
 
-/// Secret key wrapper.  On drop the secret key is zeroized.
+/// Secret key wrapper.  The key material is zeroised on drop.
 #[derive(Debug)]
 pub struct SecretKey(pub Vec<u8>);
 
@@ -75,53 +87,18 @@ impl Drop for SecretKey {
     }
 }
 
-/// Return the lengths of the public key, secret key and maximum signature for
-/// the given parameter set.  Panics if the underlying C function fails.
-fn sizes(ps: ParamSet) -> (usize, usize, usize) {
-    unsafe {
-        let mut pk_len = 0usize;
-        let mut sk_len = 0usize;
-        let mut sig_len = 0usize;
-        let rc = match ps {
-            ParamSet::MLDsa44 => {
-                #[cfg(feature = "mldsa44")]
-                {
-                    mldsa44_sizes(&mut pk_len, &mut sk_len, &mut sig_len)
-                }
-                #[cfg(not(feature = "mldsa44"))]
-                {
-                    panic!("Feature mldsa44 is not enabled");
-                }
-            }
-            ParamSet::MLDsa65 => {
-                #[cfg(feature = "mldsa65")]
-                {
-                    mldsa65_sizes(&mut pk_len, &mut sk_len, &mut sig_len)
-                }
-                #[cfg(not(feature = "mldsa65"))]
-                {
-                    panic!("Feature mldsa65 is not enabled");
-                }
-            }
-            ParamSet::MLDsa87 => {
-                #[cfg(feature = "mldsa87")]
-                {
-                    mldsa87_sizes(&mut pk_len, &mut sk_len, &mut sig_len)
-                }
-                #[cfg(not(feature = "mldsa87"))]
-                {
-                    panic!("Feature mldsa87 is not enabled");
-                }
-            }
-        };
-        assert_eq!(rc, 0, "mldsa sizes function returned error");
-        (pk_len, sk_len, sig_len)
+/// Return the buffer lengths required by the parameter set.
+fn lengths(ps: ParamSet) -> (usize, usize, usize) {
+    match ps {
+        ParamSet::MLDsa44 => (1312, 2560, 2420),
+        ParamSet::MLDsa65 => (1952, 4032, 3309),
+        ParamSet::MLDsa87 => (2592, 4896, 4627),
     }
 }
 
-/// Generate a public/secret keypair for the given parameter set.
+/// Generate an ML-DSA keypair.
 pub fn keypair(ps: ParamSet) -> (PublicKey, SecretKey) {
-    let (pk_len, sk_len, _sig_len) = sizes(ps);
+    let (pk_len, sk_len, _sig_len) = lengths(ps);
     let mut pk = vec![0u8; pk_len];
     let mut sk = vec![0u8; sk_len];
     unsafe {
@@ -129,98 +106,185 @@ pub fn keypair(ps: ParamSet) -> (PublicKey, SecretKey) {
             ParamSet::MLDsa44 => {
                 #[cfg(feature = "mldsa44")]
                 {
-                    mldsa44_keypair(pk.as_mut_ptr(), sk.as_mut_ptr())
+                    OQS_SIG_ml_dsa_44_keypair(pk.as_mut_ptr(), sk.as_mut_ptr())
                 }
                 #[cfg(not(feature = "mldsa44"))]
                 {
-                    panic!("Feature mldsa44 is not enabled");
+                    panic!("feature mldsa44 is not enabled");
                 }
             }
             ParamSet::MLDsa65 => {
                 #[cfg(feature = "mldsa65")]
                 {
-                    mldsa65_keypair(pk.as_mut_ptr(), sk.as_mut_ptr())
+                    OQS_SIG_ml_dsa_65_keypair(pk.as_mut_ptr(), sk.as_mut_ptr())
                 }
                 #[cfg(not(feature = "mldsa65"))]
                 {
-                    panic!("Feature mldsa65 is not enabled");
+                    panic!("feature mldsa65 is not enabled");
                 }
             }
             ParamSet::MLDsa87 => {
                 #[cfg(feature = "mldsa87")]
                 {
-                    mldsa87_keypair(pk.as_mut_ptr(), sk.as_mut_ptr())
+                    OQS_SIG_ml_dsa_87_keypair(pk.as_mut_ptr(), sk.as_mut_ptr())
                 }
                 #[cfg(not(feature = "mldsa87"))]
                 {
-                    panic!("Feature mldsa87 is not enabled");
+                    panic!("feature mldsa87 is not enabled");
                 }
             }
         };
-        assert_eq!(rc, 0, "mldsa keypair returned error");
+        assert_eq!(rc, 0, "liboqs keypair call failed");
     }
     (PublicKey(pk), SecretKey(sk))
 }
 
-/// Sign a message using the provided secret key and parameter set.  Returns a
-/// vector containing the raw signature bytes.
-pub fn sign(ps: ParamSet, sk: &SecretKey, msg: &[u8]) -> Vec<u8> {
-    let (_pk_len, _sk_len, sig_max) = sizes(ps);
-    let mut sig = vec![0u8; sig_max];
-    let mut sig_len: usize = 0;
+/// Sign a message with the supplied secret key.
+pub fn sign(ps: ParamSet, sk: &SecretKey, message: &[u8]) -> Vec<u8> {
+    let (_pk_len, _sk_len, sig_len) = lengths(ps);
+    let mut sig = vec![0u8; sig_len];
+    let mut actual_len: usize = sig_len;
     unsafe {
         let rc = match ps {
             ParamSet::MLDsa44 => {
                 #[cfg(feature = "mldsa44")]
                 {
-                    mldsa44_sign(
+                    OQS_SIG_ml_dsa_44_sign(
                         sig.as_mut_ptr(),
-                        &mut sig_len,
-                        msg.as_ptr(),
-                        msg.len(),
+                        &mut actual_len,
+                        message.as_ptr(),
+                        message.len(),
                         sk.0.as_ptr(),
                     )
                 }
                 #[cfg(not(feature = "mldsa44"))]
                 {
-                    panic!("Feature mldsa44 is not enabled");
+                    panic!("feature mldsa44 is not enabled");
                 }
             }
             ParamSet::MLDsa65 => {
                 #[cfg(feature = "mldsa65")]
                 {
-                    mldsa65_sign(
+                    OQS_SIG_ml_dsa_65_sign(
                         sig.as_mut_ptr(),
-                        &mut sig_len,
-                        msg.as_ptr(),
-                        msg.len(),
+                        &mut actual_len,
+                        message.as_ptr(),
+                        message.len(),
                         sk.0.as_ptr(),
                     )
                 }
                 #[cfg(not(feature = "mldsa65"))]
                 {
-                    panic!("Feature mldsa65 is not enabled");
+                    panic!("feature mldsa65 is not enabled");
                 }
             }
             ParamSet::MLDsa87 => {
                 #[cfg(feature = "mldsa87")]
                 {
-                    mldsa87_sign(
+                    OQS_SIG_ml_dsa_87_sign(
                         sig.as_mut_ptr(),
-                        &mut sig_len,
-                        msg.as_ptr(),
-                        msg.len(),
+                        &mut actual_len,
+                        message.as_ptr(),
+                        message.len(),
                         sk.0.as_ptr(),
                     )
                 }
                 #[cfg(not(feature = "mldsa87"))]
                 {
-                    panic!("Feature mldsa87 is not enabled");
+                    panic!("feature mldsa87 is not enabled");
                 }
             }
         };
-        assert_eq!(rc, 0, "mldsa sign returned error");
+        assert_eq!(rc, 0, "liboqs sign call failed");
     }
-    sig.truncate(sig_len);
+    sig.truncate(actual_len);
     sig
+}
+
+/// Verify a signature over the message using the provided public key.
+pub fn verify(ps: ParamSet, pk: &PublicKey, message: &[u8], signature: &[u8]) -> bool {
+    unsafe {
+        let rc = match ps {
+            ParamSet::MLDsa44 => {
+                #[cfg(feature = "mldsa44")]
+                {
+                    OQS_SIG_ml_dsa_44_verify(
+                        message.as_ptr(),
+                        message.len(),
+                        signature.as_ptr(),
+                        signature.len(),
+                        pk.0.as_ptr(),
+                    )
+                }
+                #[cfg(not(feature = "mldsa44"))]
+                {
+                    panic!("feature mldsa44 is not enabled");
+                }
+            }
+            ParamSet::MLDsa65 => {
+                #[cfg(feature = "mldsa65")]
+                {
+                    OQS_SIG_ml_dsa_65_verify(
+                        message.as_ptr(),
+                        message.len(),
+                        signature.as_ptr(),
+                        signature.len(),
+                        pk.0.as_ptr(),
+                    )
+                }
+                #[cfg(not(feature = "mldsa65"))]
+                {
+                    panic!("feature mldsa65 is not enabled");
+                }
+            }
+            ParamSet::MLDsa87 => {
+                #[cfg(feature = "mldsa87")]
+                {
+                    OQS_SIG_ml_dsa_87_verify(
+                        message.as_ptr(),
+                        message.len(),
+                        signature.as_ptr(),
+                        signature.len(),
+                        pk.0.as_ptr(),
+                    )
+                }
+                #[cfg(not(feature = "mldsa87"))]
+                {
+                    panic!("feature mldsa87 is not enabled");
+                }
+            }
+        };
+        rc == 0
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn roundtrip(ps: ParamSet) {
+        let (pk, sk) = keypair(ps);
+        let message = b"post-quantum authentication";
+        let signature = sign(ps, &sk, message);
+        assert!(
+            verify(ps, &pk, message, &signature),
+            "verification failed for {:?}",
+            ps
+        );
+    }
+
+    #[test]
+    fn mldsa44_roundtrip() {
+        roundtrip(ParamSet::MLDsa44);
+    }
+
+    #[test]
+    fn mldsa65_roundtrip() {
+        roundtrip(ParamSet::MLDsa65);
+    }
+
+    #[test]
+    fn mldsa87_roundtrip() {
+        roundtrip(ParamSet::MLDsa87);
+    }
 }

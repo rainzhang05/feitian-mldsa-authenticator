@@ -3,19 +3,16 @@ name = "trussed-mldsa"
 version = "0.1.0"
 edition = "2021"
 
-description = "Safe Rust wrapper around a C implementation of ML-DSA (stubbed)"
+description = "Safe Rust wrapper around liboqs ML-DSA signatures"
 authors = ["Your Name <you@example.com>"]
 license = "Apache-2.0 OR MIT"
 
 [dependencies]
-cty = "0.2"
 zeroize = { version = "1", features = ["zeroize_derive"] }
 
 [features]
 # Enable specific ML-DSA parameter sets.  All three are enabled by default.
+default = ["mldsa44", "mldsa65", "mldsa87"]
 mldsa44 = []
 mldsa65 = []
 mldsa87 = []
-
-[build-dependencies]
-cc = "1"
