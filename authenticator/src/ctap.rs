@@ -602,6 +602,7 @@ where
         credential_id: &[u8],
         cose_key: &[u8],
         uv: bool,
+        sign_count: u32,
     ) -> Vec<u8> {
         let mut hasher = Sha256::new();
         hasher.update(rp_id.as_bytes());
@@ -615,7 +616,7 @@ where
             flags |= 0x04;
         }
         auth_data.push(flags);
-        auth_data.extend_from_slice(&0u32.to_be_bytes());
+        auth_data.extend_from_slice(&sign_count.to_be_bytes());
         auth_data.extend_from_slice(&self.aaguid);
         auth_data.extend_from_slice(&(credential_id.len() as u16).to_be_bytes());
         auth_data.extend_from_slice(credential_id);
@@ -715,7 +716,7 @@ where
             _ => return Err(CTAP2_ERR_INVALID_CBOR),
         };
 
-        let _client_hash = match Self::map_get(&map, Value::Integer(Integer::from(1))) {
+        let client_hash = match Self::map_get(&map, Value::Integer(Integer::from(1))) {
             Some(Value::Bytes(bytes)) => bytes.clone(),
             _ => return Err(CTAP2_ERR_INVALID_CBOR),
         };
@@ -815,6 +816,7 @@ where
         let credential_id = credential_id_bytes.to_vec();
 
         let mut credentials = self.load_credentials()?;
+        let initial_sign_count = 0;
         credentials.push(StoredCredential {
             rp_id: rp_id.clone(),
             user_id: user_id.clone(),
@@ -824,20 +826,32 @@ where
             credential_id: credential_id.clone(),
             public_key: cose_key.clone(),
             secret_key: secret_key.0.clone(),
-            sign_count: 0,
+            sign_count: initial_sign_count,
         });
         self.save_credentials(&credentials)?;
 
         let uv = uv_requested;
-        let auth_data = self.attested_auth_data(&rp_id, &credential_id, &cose_key, uv);
+        let auth_data =
+            self.attested_auth_data(&rp_id, &credential_id, &cose_key, uv, initial_sign_count);
+        let signature = sign_challenge(alg, &secret_key, &auth_data, &client_hash);
+        let att_stmt = Value::Map(vec![
+            (
+                Value::Text("alg".into()),
+                Value::Integer(Integer::from(alg as i32)),
+            ),
+            (Value::Text("sig".into()), Value::Bytes(signature)),
+        ]);
 
         let response_map = vec![
-            (Value::Integer(Integer::from(1)), Value::Text("none".into())),
+            (
+                Value::Integer(Integer::from(1)),
+                Value::Text("packed".into()),
+            ),
             (
                 Value::Integer(Integer::from(2)),
                 Value::Bytes(auth_data.clone()),
             ),
-            (Value::Integer(Integer::from(3)), Value::Map(Vec::new())),
+            (Value::Integer(Integer::from(3)), att_stmt),
         ];
 
         let mut encoded = Vec::new();
