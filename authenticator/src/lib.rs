@@ -172,16 +172,16 @@ pub fn cose_alg_for_kem_param_set(param_set: KemParamSet) -> i32 {
 pub(crate) fn cose_akp_key_map(alg_id: i32, public_key: &[u8]) -> Value {
     Value::Map(vec![
         (
-            Value::Integer(Integer::from(COSE_KEY_PARAM_AKP_KEY)),
-            Value::Bytes(public_key.to_vec()),
-        ),
-        (
             Value::Integer(Integer::from(COSE_KEY_LABEL_KTY)),
             Value::Integer(Integer::from(COSE_KEY_TYPE_AKP)),
         ),
         (
             Value::Integer(Integer::from(COSE_KEY_LABEL_ALG)),
             Value::Integer(Integer::from(alg_id)),
+        ),
+        (
+            Value::Integer(Integer::from(COSE_KEY_PARAM_AKP_KEY)),
+            Value::Bytes(public_key.to_vec()),
         ),
     ])
 }
@@ -250,7 +250,7 @@ mod tests {
         let pk = PublicKey(pk_bytes.clone());
         let cose = cose_public_key(ParamSet::MLDsa44, &pk);
         let expected = vec![
-            0xA3, 0x20, 0x44, 0xDE, 0xAD, 0xBE, 0xEF, 0x01, 0x07, 0x03, 0x38, 0x2F,
+            0xA3, 0x01, 0x07, 0x03, 0x38, 0x2F, 0x20, 0x44, 0xDE, 0xAD, 0xBE, 0xEF,
         ];
         assert_eq!(cose, expected);
         let decoded: ciborium::value::Value =
@@ -267,7 +267,7 @@ mod tests {
         let value = cose_akp_key_map(COSE_ALG_ML_KEM_512, &pk);
         let mut encoded = Vec::new();
         into_writer(&value, &mut encoded).expect("encode ML-KEM COSE key");
-        let expected = vec![0xA3, 0x20, 0x42, 0xCA, 0xFE, 0x01, 0x07, 0x03, 0x38, 0x6D];
+        let expected = vec![0xA3, 0x01, 0x07, 0x03, 0x38, 0x6D, 0x20, 0x42, 0xCA, 0xFE];
         assert_eq!(encoded, expected);
     }
 
