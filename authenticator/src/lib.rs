@@ -33,12 +33,26 @@ use ciborium::value::{Integer, Value};
 use hkdf::Hkdf;
 use sha2::Sha256;
 use trussed_mldsa::{keypair, sign, ParamSet, PublicKey, SecretKey};
+use trussed_mlkem::ParamSet as KemParamSet;
 use zeroize::Zeroize;
 
 pub mod ctap;
 
 /// Identifier advertised in `authenticatorGetInfo` for the PQC PIN/UV protocol.
 pub const PIN_UV_AUTH_PROTOCOL_PQC: u8 = 101;
+
+/// COSE key type value assigned to Algorithm Key Pairs (AKP).
+pub const COSE_KEY_TYPE_AKP: i32 = 7;
+
+/// Standard COSE key map labels used by AKP keys.
+pub const COSE_KEY_LABEL_KTY: i32 = 1;
+pub const COSE_KEY_LABEL_ALG: i32 = 3;
+pub const COSE_KEY_PARAM_AKP_KEY: i32 = -1;
+
+/// COSE algorithm identifiers for ML-KEM parameter sets.
+pub const COSE_ALG_ML_KEM_512: i32 = -110;
+pub const COSE_ALG_ML_KEM_768: i32 = -111;
+pub const COSE_ALG_ML_KEM_1024: i32 = -112;
 
 /// Session keys derived from an ML-KEM shared secret and the transcript hash.
 #[derive(Debug, Zeroize)]
@@ -145,45 +159,50 @@ pub fn paramset_from_alg(alg: CoseAlg) -> ParamSet {
     }
 }
 
+/// Translate an ML-KEM parameter set to the corresponding COSE `alg` value.
+pub fn cose_alg_for_kem_param_set(param_set: KemParamSet) -> i32 {
+    match param_set {
+        KemParamSet::MLKem512 => COSE_ALG_ML_KEM_512,
+        KemParamSet::MLKem768 => COSE_ALG_ML_KEM_768,
+        KemParamSet::MLKem1024 => COSE_ALG_ML_KEM_1024,
+    }
+}
+
+/// Build a COSE_Key map for an AKP public key using canonical ordering.
+pub(crate) fn cose_akp_key_map(alg_id: i32, public_key: &[u8]) -> Value {
+    Value::Map(vec![
+        (
+            Value::Integer(Integer::from(COSE_KEY_PARAM_AKP_KEY)),
+            Value::Bytes(public_key.to_vec()),
+        ),
+        (
+            Value::Integer(Integer::from(COSE_KEY_LABEL_KTY)),
+            Value::Integer(Integer::from(COSE_KEY_TYPE_AKP)),
+        ),
+        (
+            Value::Integer(Integer::from(COSE_KEY_LABEL_ALG)),
+            Value::Integer(Integer::from(alg_id)),
+        ),
+    ])
+}
+
 /// Generate a COSE_Key for a given public key and parameter set.
 ///
-/// The returned vector contains the CBOR encoding of a map with the
-/// standard fields:
+/// The returned vector contains the CBOR encoding of the standard AKP
+/// structure:
 ///
-/// * **1 (kty)**: key type; here we reuse OKP (1) as a placeholder.
+/// * **1 (kty)**: the Algorithm Key Pair key type (7).
 /// * **3 (alg)**: the COSE algorithm identifier (-48/-49/-50).
-/// * **-1 (crv)**: a curve identifier equal to 44, 65 or 87, matching the
-///   parameter set.
-/// * **-2 (x)**: the raw public key bytes.
-///
-/// In a production implementation the key type and labels should match the
-/// values assigned by the IANA COSE registry once ML-DSA is finalised.
+/// * **-1**: the raw public key bytes.
 pub fn cose_public_key(ps: ParamSet, pk: &PublicKey) -> Vec<u8> {
-    let (alg_id, curve_id) = match ps {
-        ParamSet::MLDsa44 => (-48, 44),
-        ParamSet::MLDsa65 => (-49, 65),
-        ParamSet::MLDsa87 => (-50, 87),
+    let alg_id = match ps {
+        ParamSet::MLDsa44 => CoseAlg::MLDSA44 as i32,
+        ParamSet::MLDsa65 => CoseAlg::MLDSA65 as i32,
+        ParamSet::MLDsa87 => CoseAlg::MLDSA87 as i32,
     };
-    // Build a CBOR map {1:1, 3:alg_id, -1:curve_id, -2:pk_bytes}
-    let mut m = Vec::with_capacity(4);
-    m.push((
-        Value::Integer(Integer::from(1)),
-        Value::Integer(Integer::from(1)),
-    ));
-    m.push((
-        Value::Integer(Integer::from(3)),
-        Value::Integer(Integer::from(alg_id)),
-    ));
-    m.push((
-        Value::Integer(Integer::from(-1)),
-        Value::Integer(Integer::from(curve_id)),
-    ));
-    m.push((
-        Value::Integer(Integer::from(-2)),
-        Value::Bytes(pk.0.clone()),
-    ));
     let mut out = Vec::new();
-    into_writer(&Value::Map(m), &mut out).expect("CBOR encoding failed");
+    let map = cose_akp_key_map(alg_id, &pk.0);
+    into_writer(&map, &mut out).expect("CBOR encoding failed");
     out
 }
 
@@ -221,9 +240,52 @@ pub fn sign_challenge(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use ciborium::value::Integer;
+    use ciborium::{de::from_reader, ser::into_writer, value::Integer};
     use trussed_mldsa::verify;
     use trussed_mlkem::{self, ParamSet as KemParamSet};
+
+    #[test]
+    fn cose_public_key_canonical_encoding_matches_fixture() {
+        let pk_bytes = vec![0xDE, 0xAD, 0xBE, 0xEF];
+        let pk = PublicKey(pk_bytes.clone());
+        let cose = cose_public_key(ParamSet::MLDsa44, &pk);
+        let expected = vec![
+            0xA3, 0x20, 0x44, 0xDE, 0xAD, 0xBE, 0xEF, 0x01, 0x07, 0x03, 0x38, 0x2F,
+        ];
+        assert_eq!(cose, expected);
+        let decoded: ciborium::value::Value =
+            from_reader(cose.as_slice()).expect("valid COSE public key");
+        assert_eq!(
+            decoded,
+            cose_akp_key_map(CoseAlg::MLDSA44 as i32, &pk_bytes)
+        );
+    }
+
+    #[test]
+    fn mlkem_akp_map_matches_canonical_fixture() {
+        let pk = [0xCA, 0xFE];
+        let value = cose_akp_key_map(COSE_ALG_ML_KEM_512, &pk);
+        let mut encoded = Vec::new();
+        into_writer(&value, &mut encoded).expect("encode ML-KEM COSE key");
+        let expected = vec![0xA3, 0x20, 0x42, 0xCA, 0xFE, 0x01, 0x07, 0x03, 0x38, 0x6D];
+        assert_eq!(encoded, expected);
+    }
+
+    #[test]
+    fn mlkem_alg_mapping_matches_expected_values() {
+        assert_eq!(
+            cose_alg_for_kem_param_set(KemParamSet::MLKem512),
+            COSE_ALG_ML_KEM_512
+        );
+        assert_eq!(
+            cose_alg_for_kem_param_set(KemParamSet::MLKem768),
+            COSE_ALG_ML_KEM_768
+        );
+        assert_eq!(
+            cose_alg_for_kem_param_set(KemParamSet::MLKem1024),
+            COSE_ALG_ML_KEM_1024
+        );
+    }
 
     #[test]
     fn mldsa_roundtrip_signatures() {
@@ -244,7 +306,7 @@ mod tests {
         let value: ciborium::value::Value = ciborium::de::from_reader(cbor).expect("valid CBOR");
         if let ciborium::value::Value::Map(map) = value {
             for (k, v) in map {
-                if k == ciborium::value::Value::Integer(Integer::from(-2)) {
+                if k == ciborium::value::Value::Integer(Integer::from(COSE_KEY_PARAM_AKP_KEY)) {
                     if let ciborium::value::Value::Bytes(bytes) = v {
                         return bytes;
                     }

@@ -1,6 +1,7 @@
 use crate::{
-    create_credential, decrypt_pin_block, derive_pin_uv_session_keys, encrypt_pin_block,
-    sign_challenge, CoseAlg, PinUvSessionKeys, PIN_UV_AUTH_PROTOCOL_PQC,
+    cose_akp_key_map, cose_alg_for_kem_param_set, create_credential, decrypt_pin_block,
+    derive_pin_uv_session_keys, encrypt_pin_block, sign_challenge, CoseAlg, PinUvSessionKeys,
+    PIN_UV_AUTH_PROTOCOL_PQC,
 };
 
 use ciborium::{
@@ -183,24 +184,14 @@ impl PinProtocolSession {
 
     fn key_agreement_value(&self) -> Value {
         match self {
-            PinProtocolSession::Pqc { public_key, .. } => Value::Map(vec![
-                (
-                    Value::Integer(Integer::from(1)),
-                    Value::Integer(Integer::from(1)),
-                ),
-                (
-                    Value::Integer(Integer::from(3)),
-                    Value::Integer(Integer::from(-101)),
-                ),
-                (
-                    Value::Integer(Integer::from(-1)),
-                    Value::Integer(Integer::from(512)),
-                ),
-                (
-                    Value::Integer(Integer::from(-2)),
-                    Value::Bytes(public_key.clone()),
-                ),
-            ]),
+            PinProtocolSession::Pqc {
+                param_set,
+                public_key,
+                ..
+            } => {
+                let alg = cose_alg_for_kem_param_set(*param_set);
+                cose_akp_key_map(alg, public_key)
+            }
             PinProtocolSession::Classic { public_key, .. } => {
                 let (x, y) = match (public_key.x(), public_key.y()) {
                     (Some(x_bytes), Some(y_bytes)) => (x_bytes.to_vec(), y_bytes.to_vec()),
@@ -304,6 +295,32 @@ impl PinProtocolSession {
                 Ok((keys, transcript_hash))
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ciborium::ser::into_writer;
+    use trussed_mlkem::{ParamSet as KemParamSet, SecretKey as KemSecretKey};
+
+    #[test]
+    fn pqc_key_agreement_value_is_canonical_akp_map() {
+        let public_key = vec![0x01, 0x02];
+        let session = PinProtocolSession::Pqc {
+            param_set: KemParamSet::MLKem512,
+            secret_key: KemSecretKey(vec![]),
+            public_key: public_key.clone(),
+        };
+
+        let value = session.key_agreement_value();
+        let expected_alg = cose_alg_for_kem_param_set(KemParamSet::MLKem512);
+        assert_eq!(value, cose_akp_key_map(expected_alg, &public_key));
+
+        let mut encoded = Vec::new();
+        into_writer(&value, &mut encoded).expect("encode COSE key agreement map");
+        let expected = vec![0xA3, 0x20, 0x42, 0x01, 0x02, 0x01, 0x07, 0x03, 0x38, 0x6D];
+        assert_eq!(encoded, expected);
     }
 }
 
