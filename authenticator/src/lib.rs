@@ -1,15 +1,21 @@
+use aes::Aes256;
 #[allow(deprecated)]
 use aes_gcm::aead::{generic_array::GenericArray, Aead, KeyInit, Payload};
 use aes_gcm::Aes256Gcm;
+use cbc::cipher::{block_padding::NoPadding, BlockDecryptMut, BlockEncryptMut, KeyIvInit};
+use cbc::{Decryptor, Encryptor};
 use ciborium::ser::into_writer;
 use ciborium::value::{Integer, Value};
 use hkdf::Hkdf;
-use sha2::Sha256;
+use sha2::{Digest, Sha256};
 use trussed_mldsa::{keypair, sign, ParamSet, PublicKey, SecretKey};
 use trussed_mlkem::ParamSet as KemParamSet;
 use zeroize::Zeroize;
 
 pub mod ctap;
+
+type Aes256CbcEncryptor = Encryptor<Aes256>;
+type Aes256CbcDecryptor = Decryptor<Aes256>;
 
 /// Identifier advertised in `authenticatorGetInfo` for the PQC PIN/UV protocol.
 pub const PIN_UV_AUTH_PROTOCOL_PQC: u8 = 101;
@@ -35,9 +41,26 @@ pub struct PinUvSessionKeys {
     pub auth_key: [u8; 32],
 }
 
+/// Supported classic PIN/UV protocol variants.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum ClassicPinProtocol {
+    V1,
+    V2,
+}
+
+impl ClassicPinProtocol {
+    /// Return the CTAP2 identifier associated with this protocol variant.
+    pub fn identifier(self) -> i32 {
+        match self {
+            ClassicPinProtocol::V1 => 1,
+            ClassicPinProtocol::V2 => 2,
+        }
+    }
+}
+
 /// Derive the AES-256-GCM encryption key and the 32-byte HMAC key used for
 /// client PIN handling.  The HKDF salt binds the keys to the transcript hash.
-pub fn derive_pin_uv_session_keys(
+pub fn derive_pqc_pin_uv_session_keys(
     shared_secret: &[u8],
     transcript_hash: &[u8],
 ) -> PinUvSessionKeys {
@@ -56,10 +79,40 @@ pub fn derive_pin_uv_session_keys(
     }
 }
 
+/// Derive the AES/HMAC keys for the classic PIN/UV protocols.
+pub fn derive_classic_pin_uv_session_keys(
+    protocol: ClassicPinProtocol,
+    shared_secret: &[u8],
+) -> PinUvSessionKeys {
+    let hash = Sha256::digest(shared_secret);
+    let mut shared = [0u8; 32];
+    shared.copy_from_slice(&hash);
+    let mut encryption_key = [0u8; 32];
+    let mut auth_key = [0u8; 32];
+    match protocol {
+        ClassicPinProtocol::V1 => {
+            encryption_key.copy_from_slice(&shared);
+            auth_key.copy_from_slice(&shared);
+        }
+        ClassicPinProtocol::V2 => {
+            let hkdf = Hkdf::<Sha256>::new(None, &shared);
+            hkdf.expand(b"CTAP2 AES key", &mut encryption_key)
+                .expect("HKDF expand must not fail for valid length");
+            hkdf.expand(b"CTAP2 HMAC key", &mut auth_key)
+                .expect("HKDF expand must not fail for valid length");
+        }
+    }
+    shared.zeroize();
+    PinUvSessionKeys {
+        encryption_key,
+        auth_key,
+    }
+}
+
 /// Encrypt PIN data using AES-256-GCM.  The transcript hash should be supplied
 /// as AAD to bind the ciphertext to the protocol run.
 #[allow(deprecated)]
-pub fn encrypt_pin_block(
+pub fn encrypt_pqc_pin_block(
     keys: &PinUvSessionKeys,
     nonce: &[u8; 12],
     plaintext: &[u8],
@@ -80,7 +133,7 @@ pub fn encrypt_pin_block(
 
 /// Decrypt the PIN block using AES-256-GCM and the previously derived keys.
 #[allow(deprecated)]
-pub fn decrypt_pin_block(
+pub fn decrypt_pqc_pin_block(
     keys: &PinUvSessionKeys,
     nonce: &[u8; 12],
     ciphertext: &[u8],
@@ -95,6 +148,75 @@ pub fn decrypt_pin_block(
             aad: transcript_hash,
         },
     )
+}
+
+/// Encrypt a classic PIN block using AES-256-CBC.  Protocol 1 uses an all-zero
+/// IV, while protocol 2 prepends the random IV to the ciphertext.
+pub fn encrypt_classic_pin_block(
+    protocol: ClassicPinProtocol,
+    keys: &PinUvSessionKeys,
+    iv: Option<&[u8; 16]>,
+    plaintext: &[u8],
+) -> Result<Vec<u8>, ()> {
+    match protocol {
+        ClassicPinProtocol::V1 => {
+            if plaintext.len() % 16 != 0 {
+                return Err(());
+            }
+            let iv = [0u8; 16];
+            let cipher =
+                Aes256CbcEncryptor::new_from_slices(&keys.encryption_key, &iv).map_err(|_| ())?;
+            Ok(cipher.encrypt_padded_vec_mut::<NoPadding>(plaintext))
+        }
+        ClassicPinProtocol::V2 => {
+            let iv = iv.ok_or(())?;
+            if plaintext.len() % 16 != 0 {
+                return Err(());
+            }
+            let cipher =
+                Aes256CbcEncryptor::new_from_slices(&keys.encryption_key, iv).map_err(|_| ())?;
+            let mut ciphertext = cipher.encrypt_padded_vec_mut::<NoPadding>(plaintext);
+            let mut out = Vec::with_capacity(16 + ciphertext.len());
+            out.extend_from_slice(iv);
+            out.append(&mut ciphertext);
+            Ok(out)
+        }
+    }
+}
+
+/// Decrypt a classic PIN block using AES-256-CBC.
+pub fn decrypt_classic_pin_block(
+    protocol: ClassicPinProtocol,
+    keys: &PinUvSessionKeys,
+    ciphertext: &[u8],
+) -> Result<Vec<u8>, ()> {
+    match protocol {
+        ClassicPinProtocol::V1 => {
+            let iv = [0u8; 16];
+            let cipher =
+                Aes256CbcDecryptor::new_from_slices(&keys.encryption_key, &iv).map_err(|_| ())?;
+            if ciphertext.len() % 16 != 0 {
+                return Err(());
+            }
+            cipher
+                .decrypt_padded_vec_mut::<NoPadding>(ciphertext)
+                .map_err(|_| ())
+        }
+        ClassicPinProtocol::V2 => {
+            if ciphertext.len() < 16 {
+                return Err(());
+            }
+            let (iv, body) = ciphertext.split_at(16);
+            let cipher =
+                Aes256CbcDecryptor::new_from_slices(&keys.encryption_key, iv).map_err(|_| ())?;
+            if body.len() % 16 != 0 {
+                return Err(());
+            }
+            cipher
+                .decrypt_padded_vec_mut::<NoPadding>(body)
+                .map_err(|_| ())
+        }
+    }
 }
 
 /// Enumeration of COSE algorithm identifiers for ML-DSA.  These values
@@ -297,12 +419,12 @@ mod tests {
         let shared_secret_auth =
             trussed_mlkem::decapsulate(KemParamSet::MLKem512, &sk, &ciphertext);
         let transcript_hash = b"transcript";
-        let client_keys = derive_pin_uv_session_keys(&shared_secret_client.0, transcript_hash);
-        let auth_keys = derive_pin_uv_session_keys(&shared_secret_auth.0, transcript_hash);
+        let client_keys = derive_pqc_pin_uv_session_keys(&shared_secret_client.0, transcript_hash);
+        let auth_keys = derive_pqc_pin_uv_session_keys(&shared_secret_auth.0, transcript_hash);
         let nonce = [0u8; 12];
         let plaintext = b"PIN data";
-        let ciphertext = encrypt_pin_block(&client_keys, &nonce, plaintext, transcript_hash);
-        let decrypted = decrypt_pin_block(&auth_keys, &nonce, &ciphertext, transcript_hash)
+        let ciphertext = encrypt_pqc_pin_block(&client_keys, &nonce, plaintext, transcript_hash);
+        let decrypted = decrypt_pqc_pin_block(&auth_keys, &nonce, &ciphertext, transcript_hash)
             .expect("decryption should succeed");
         assert_eq!(plaintext.to_vec(), decrypted);
     }
