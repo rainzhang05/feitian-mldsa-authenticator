@@ -500,7 +500,8 @@ impl PinProtocolSession {
                     return Err(CTAP1_ERR_INVALID_PARAMETER);
                 };
                 let ciphertext = Ciphertext(ciphertext_bytes.clone());
-                let shared = trussed_mlkem::decapsulate(param_set, &secret_key, &ciphertext);
+                let shared = trussed_mlkem::decapsulate(param_set, &secret_key, &ciphertext)
+                    .map_err(|_| CTAP1_ERR_INVALID_PARAMETER)?;
                 let mut hasher = Sha256::new();
                 hasher.update(&public_key);
                 hasher.update(&ciphertext_bytes);

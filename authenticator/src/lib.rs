@@ -416,8 +416,8 @@ mod tests {
         let (pk, sk) = trussed_mlkem::keypair(KemParamSet::MLKem512);
         let (ciphertext, shared_secret_client) =
             trussed_mlkem::encapsulate(KemParamSet::MLKem512, &pk);
-        let shared_secret_auth =
-            trussed_mlkem::decapsulate(KemParamSet::MLKem512, &sk, &ciphertext);
+        let shared_secret_auth = trussed_mlkem::decapsulate(KemParamSet::MLKem512, &sk, &ciphertext)
+            .expect("ciphertext should be valid");
         let transcript_hash = b"transcript";
         let client_keys = derive_pqc_pin_uv_session_keys(&shared_secret_client.0, transcript_hash);
         let auth_keys = derive_pqc_pin_uv_session_keys(&shared_secret_auth.0, transcript_hash);

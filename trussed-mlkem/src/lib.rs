@@ -184,9 +184,23 @@ pub fn encapsulate(ps: ParamSet, pk: &PublicKey) -> (Ciphertext, SharedSecret) {
     (Ciphertext(ct), SharedSecret(ss))
 }
 
+/// Errors that can occur during decapsulation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DecapsulationError {
+    /// The ciphertext length does not match the parameter set requirements.
+    InvalidCiphertextLength,
+}
+
 /// Decapsulate the shared secret from a ciphertext using the secret key.
-pub fn decapsulate(ps: ParamSet, sk: &SecretKey, ct: &Ciphertext) -> SharedSecret {
-    let (_pk_len, _sk_len, _ct_len, ss_len) = lengths(ps);
+pub fn decapsulate(
+    ps: ParamSet,
+    sk: &SecretKey,
+    ct: &Ciphertext,
+) -> Result<SharedSecret, DecapsulationError> {
+    let (_pk_len, _sk_len, ct_len, ss_len) = lengths(ps);
+    if ct.0.len() != ct_len {
+        return Err(DecapsulationError::InvalidCiphertextLength);
+    }
     let mut ss = vec![0u8; ss_len];
     unsafe {
         let rc = match ps {
@@ -223,7 +237,7 @@ pub fn decapsulate(ps: ParamSet, sk: &SecretKey, ct: &Ciphertext) -> SharedSecre
         };
         assert_eq!(rc, 0, "liboqs decaps call failed");
     }
-    SharedSecret(ss)
+    Ok(SharedSecret(ss))
 }
 
 #[cfg(test)]
@@ -233,8 +247,23 @@ mod tests {
     fn roundtrip(ps: ParamSet) {
         let (pk, sk) = keypair(ps);
         let (ct, ss_enc) = encapsulate(ps, &pk);
-        let ss_dec = decapsulate(ps, &sk, &ct);
+        let ss_dec = decapsulate(ps, &sk, &ct).expect("ciphertext should be valid");
         assert_eq!(ss_enc.0, ss_dec.0, "shared secret mismatch for {:?}", ps);
+
+        // Reject ciphertexts with invalid length.
+        let mut truncated = ct.0.clone();
+        truncated.pop();
+        assert!(matches!(
+            decapsulate(ps, &sk, &Ciphertext(truncated)),
+            Err(DecapsulationError::InvalidCiphertextLength)
+        ));
+
+        let mut oversized = ct.0.clone();
+        oversized.push(0);
+        assert!(matches!(
+            decapsulate(ps, &sk, &Ciphertext(oversized)),
+            Err(DecapsulationError::InvalidCiphertextLength)
+        ));
     }
 
     #[test]
