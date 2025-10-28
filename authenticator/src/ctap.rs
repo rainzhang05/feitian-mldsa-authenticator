@@ -901,13 +901,16 @@ where
             _ => return Err(CTAP2_ERR_MISSING_PARAMETER),
         };
         let pin_auth_param = match Self::map_get(map, Value::Integer(Integer::from(4))) {
-            Some(Value::Bytes(bytes)) => bytes.clone(),
-            _ => return Err(CTAP2_ERR_MISSING_PARAMETER),
+            Some(Value::Bytes(bytes)) => Some(bytes.clone()),
+            Some(_) => return Err(CTAP2_ERR_INVALID_CBOR),
+            None => None,
         };
 
         let session = self.take_session(protocol)?;
         let (keys, transcript_hash) = session.derive_session_keys(key_agreement)?;
-        Self::verify_pin_auth(protocol, &keys, &pin_hash_enc, &pin_auth_param)?;
+        if let Some(pin_auth_param) = pin_auth_param.as_ref() {
+            Self::verify_pin_auth(protocol, &keys, &pin_hash_enc, pin_auth_param)?;
+        }
 
         let mut plain =
             Self::decrypt_pin_block_checked(protocol, &keys, &transcript_hash, &pin_hash_enc)?;

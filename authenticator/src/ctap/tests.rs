@@ -2201,6 +2201,155 @@ fn client_pin_token_with_permissions_sets_metadata() {
 }
 
 #[test]
+fn client_pin_get_token_legacy_succeeds_without_pin_uv_auth_param() {
+    let mut app = CtapApp::new(TestClient::new(), [0xAA; 16]);
+    let pin = b"9876";
+    let mut hasher = Sha256::new();
+    hasher.update(pin);
+    let digest = hasher.finalize();
+    let mut pin_hash = [0u8; 16];
+    pin_hash.copy_from_slice(&digest[..16]);
+    app.pin_state.set_pin(pin_hash);
+
+    let auth_entries = request_classic_key_agreement(&mut app, ClassicPinProtocol::V2);
+    let platform_secret = P256SecretKey::from_slice(&[0x55; 32]).expect("valid platform secret");
+    let (keys, _transcript_hash, platform_entries) =
+        derive_classic_session(ClassicPinProtocol::V2, &auth_entries, &platform_secret);
+    let iv = [0xCC; 16];
+    let pin_hash_enc = classic_encrypt(ClassicPinProtocol::V2, &keys, &digest[..16], Some(iv));
+
+    let request_map = canonical_map(vec![
+        (
+            Value::Integer(Integer::from(1)),
+            Value::Integer(Integer::from(PIN_UV_AUTH_PROTOCOL_CLASSIC)),
+        ),
+        (
+            Value::Integer(Integer::from(2)),
+            Value::Integer(Integer::from(0x05)),
+        ),
+        (
+            Value::Integer(Integer::from(3)),
+            canonical_map(platform_entries.clone()),
+        ),
+        (
+            Value::Integer(Integer::from(6)),
+            Value::Bytes(pin_hash_enc.clone()),
+        ),
+    ]);
+    let mut payload = Vec::new();
+    into_writer(&request_map, &mut payload).expect("serialize getPinToken request");
+    let response = app
+        .handle_client_pin(&payload)
+        .expect("getPinToken without pinUvAuthParam succeeds");
+    assert_eq!(response[0], CTAP2_OK);
+    let Value::Map(map) = from_reader(&response[1..])
+        .expect("decode getPinToken response without pinUvAuthParam")
+    else {
+        panic!("response must be a map");
+    };
+    let encrypted_token = map
+        .into_iter()
+        .find(|(k, _)| *k == Value::Integer(Integer::from(2)))
+        .and_then(|(_, v)| match v {
+            Value::Bytes(bytes) => Some(bytes),
+            _ => None,
+        })
+        .expect("encrypted token present");
+    let decrypted_token = crate::decrypt_classic_pin_block(
+        ClassicPinProtocol::V2,
+        &keys,
+        &encrypted_token,
+    )
+    .expect("token decrypts");
+    assert_eq!(decrypted_token.len(), 32);
+    let mut expected_token = [0u8; 32];
+    expected_token.copy_from_slice(&decrypted_token);
+    assert_eq!(app.pin_state.pin_uv_auth_token(), Some(expected_token));
+}
+
+#[test]
+fn client_pin_token_with_permissions_accepts_missing_pin_uv_auth_param() {
+    let mut app = CtapApp::new(TestClient::new(), [0xAB; 16]);
+    let pin = b"2468";
+    let mut hasher = Sha256::new();
+    hasher.update(pin);
+    let digest = hasher.finalize();
+    let mut pin_hash = [0u8; 16];
+    pin_hash.copy_from_slice(&digest[..16]);
+    app.pin_state.set_pin(pin_hash);
+
+    let auth_entries = request_classic_key_agreement(&mut app, ClassicPinProtocol::V2);
+    let platform_secret = P256SecretKey::from_slice(&[0x66; 32]).expect("valid platform secret");
+    let (keys, _transcript_hash, platform_entries) =
+        derive_classic_session(ClassicPinProtocol::V2, &auth_entries, &platform_secret);
+    let iv = [0xDD; 16];
+    let pin_hash_enc = classic_encrypt(ClassicPinProtocol::V2, &keys, &digest[..16], Some(iv));
+
+    let request_map = canonical_map(vec![
+        (
+            Value::Integer(Integer::from(1)),
+            Value::Integer(Integer::from(PIN_UV_AUTH_PROTOCOL_CLASSIC)),
+        ),
+        (
+            Value::Integer(Integer::from(2)),
+            Value::Integer(Integer::from(0x09)),
+        ),
+        (
+            Value::Integer(Integer::from(3)),
+            canonical_map(platform_entries.clone()),
+        ),
+        (
+            Value::Integer(Integer::from(6)),
+            Value::Bytes(pin_hash_enc.clone()),
+        ),
+        (
+            Value::Integer(Integer::from(9)),
+            Value::Integer(Integer::from(
+                (PIN_PERMISSION_MC | PIN_PERMISSION_GA) as i32,
+            )),
+        ),
+        (
+            Value::Integer(Integer::from(10)),
+            Value::Text("example.org".into()),
+        ),
+    ]);
+    let mut payload = Vec::new();
+    into_writer(&request_map, &mut payload)
+        .expect("serialize getPinUvAuthTokenWithPermissions request");
+    let response = app
+        .handle_client_pin(&payload)
+        .expect("getPinUvAuthTokenWithPermissions without pinUvAuthParam succeeds");
+    assert_eq!(response[0], CTAP2_OK);
+    let Value::Map(map) = from_reader(&response[1..])
+        .expect("decode getPinUvAuthTokenWithPermissions response")
+    else {
+        panic!("response must be a map");
+    };
+    let encrypted_token = map
+        .into_iter()
+        .find(|(k, _)| *k == Value::Integer(Integer::from(2)))
+        .and_then(|(_, v)| match v {
+            Value::Bytes(bytes) => Some(bytes),
+            _ => None,
+        })
+        .expect("encrypted token present");
+    let decrypted_token = crate::decrypt_classic_pin_block(
+        ClassicPinProtocol::V2,
+        &keys,
+        &encrypted_token,
+    )
+    .expect("token decrypts");
+    assert_eq!(decrypted_token.len(), 32);
+    let mut expected_token = [0u8; 32];
+    expected_token.copy_from_slice(&decrypted_token);
+    assert_eq!(app.pin_state.pin_uv_auth_token(), Some(expected_token));
+    assert!(app.pin_state.has_permission(PIN_PERMISSION_MC));
+    assert!(app.pin_state.has_permission(PIN_PERMISSION_GA));
+    assert!(!app.pin_state.has_permission(PIN_PERMISSION_CM));
+    assert_eq!(app.pin_state.permissions_rp_id(), Some("example.org"));
+}
+
+#[test]
 fn client_pin_token_with_permissions_requires_rp_id() {
     let mut app = CtapApp::new(TestClient::new(), [0xA8; 16]);
     let pin = b"1234";
