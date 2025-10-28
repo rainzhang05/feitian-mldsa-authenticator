@@ -29,7 +29,50 @@ use trussed::{
 use trussed_mlkem::{self, Ciphertext, ParamSet as KemParamSet, SecretKey as KemSecretKey};
 use zeroize::Zeroize;
 
+use std::cmp::Ordering;
 use trussed_mldsa::SecretKey;
+
+fn canonical_fallback_cmp(left: &Value, right: &Value) -> Ordering {
+    let mut left_bytes = Vec::new();
+    into_writer(left, &mut left_bytes).expect("serialize left key for canonical ordering");
+    let mut right_bytes = Vec::new();
+    into_writer(right, &mut right_bytes).expect("serialize right key for canonical ordering");
+    match left_bytes.len().cmp(&right_bytes.len()) {
+        Ordering::Equal => left_bytes.cmp(&right_bytes),
+        other => other,
+    }
+}
+
+fn canonical_key_cmp(left: &Value, right: &Value) -> Ordering {
+    use Value::{Integer as IntValue, Text};
+
+    match (left, right) {
+        (IntValue(left_int), IntValue(right_int)) => left_int.canonical_cmp(right_int),
+        (IntValue(_), Text(_)) => Ordering::Less,
+        (Text(_), IntValue(_)) => Ordering::Greater,
+        (Text(left_text), Text(right_text)) => match left_text.len().cmp(&right_text.len()) {
+            Ordering::Equal => left_text.cmp(right_text),
+            other => other,
+        },
+        (Value::Bytes(left_bytes), Value::Bytes(right_bytes)) => {
+            match left_bytes.len().cmp(&right_bytes.len()) {
+                Ordering::Equal => left_bytes.cmp(right_bytes),
+                other => other,
+            }
+        }
+        (Value::Bool(left_bool), Value::Bool(right_bool)) => left_bool.cmp(right_bool),
+        _ => canonical_fallback_cmp(left, right),
+    }
+}
+
+fn canonical_sort(entries: &mut Vec<(Value, Value)>) {
+    entries.sort_by(|(left_key, _), (right_key, _)| canonical_key_cmp(left_key, right_key));
+}
+
+fn canonical_map(mut entries: Vec<(Value, Value)>) -> Value {
+    canonical_sort(&mut entries);
+    Value::Map(entries)
+}
 
 const CTAP_CMD_MAKE_CREDENTIAL: u8 = 0x01;
 const CTAP_CMD_GET_ASSERTION: u8 = 0x02;
@@ -207,7 +250,7 @@ impl PinProtocolSession {
                     (Some(x_bytes), Some(y_bytes)) => (x_bytes.to_vec(), y_bytes.to_vec()),
                     _ => (Vec::new(), Vec::new()),
                 };
-                Value::Map(vec![
+                canonical_map(vec![
                     (
                         Value::Integer(Integer::from(1)),
                         Value::Integer(Integer::from(2)),
@@ -419,8 +462,244 @@ mod tests {
         assert_eq!(encoded, expected);
     }
 
+    #[test]
+    fn classic_key_agreement_value_is_canonical() {
+        let secret_key = P256SecretKey::from_slice(&[0x13; 32]).expect("valid secret key");
+        let public_key = secret_key.public_key().to_encoded_point(false);
+        let session = PinProtocolSession::Classic {
+            public_key: public_key.clone(),
+            secret_key,
+        };
+
+        let value = session.key_agreement_value();
+        let x = public_key
+            .x()
+            .expect("x coordinate present")
+            .as_slice()
+            .to_vec();
+        let y = public_key
+            .y()
+            .expect("y coordinate present")
+            .as_slice()
+            .to_vec();
+
+        let expected = canonical_map(vec![
+            (
+                Value::Integer(Integer::from(1)),
+                Value::Integer(Integer::from(2)),
+            ),
+            (
+                Value::Integer(Integer::from(3)),
+                Value::Integer(Integer::from(-25)),
+            ),
+            (
+                Value::Integer(Integer::from(-1)),
+                Value::Integer(Integer::from(1)),
+            ),
+            (Value::Integer(Integer::from(-2)), Value::Bytes(x)),
+            (Value::Integer(Integer::from(-3)), Value::Bytes(y)),
+        ]);
+
+        assert_eq!(value, expected);
+
+        let mut actual_bytes = Vec::new();
+        into_writer(&value, &mut actual_bytes).expect("encode classic key agreement map");
+        let mut expected_bytes = Vec::new();
+        into_writer(&expected, &mut expected_bytes)
+            .expect("encode expected classic key agreement map");
+        assert_eq!(actual_bytes, expected_bytes);
+    }
+
+    #[test]
+    fn get_info_response_encoding_is_canonical() {
+        let aaguid = [0xAB; 16];
+        let app = CtapApp::new(TestClient::new(), aaguid);
+
+        let response = app.handle_get_info().expect("getInfo succeeds");
+        assert_eq!(response[0], CTAP2_OK);
+
+        let options = canonical_map(vec![
+            (Value::Text("rk".into()), Value::Bool(true)),
+            (Value::Text("uv".into()), Value::Bool(true)),
+            (Value::Text("up".into()), Value::Bool(true)),
+            (Value::Text("pinUvAuthToken".into()), Value::Bool(true)),
+            (Value::Text("clientPin".into()), Value::Bool(true)),
+        ]);
+
+        let algorithms = Value::Array(vec![
+            canonical_map(vec![
+                (Value::Text("type".into()), Value::Text("public-key".into())),
+                (
+                    Value::Text("alg".into()),
+                    Value::Integer(Integer::from(CoseAlg::MLDSA44 as i32)),
+                ),
+            ]),
+            canonical_map(vec![
+                (Value::Text("type".into()), Value::Text("public-key".into())),
+                (
+                    Value::Text("alg".into()),
+                    Value::Integer(Integer::from(CoseAlg::MLDSA65 as i32)),
+                ),
+            ]),
+            canonical_map(vec![
+                (Value::Text("type".into()), Value::Text("public-key".into())),
+                (
+                    Value::Text("alg".into()),
+                    Value::Integer(Integer::from(CoseAlg::MLDSA87 as i32)),
+                ),
+            ]),
+        ]);
+
+        let expected_map = canonical_map(vec![
+            (
+                Value::Integer(Integer::from(1)),
+                Value::Array(vec![Value::Text("FIDO_2_1".into())]),
+            ),
+            (
+                Value::Integer(Integer::from(3)),
+                Value::Bytes(aaguid.to_vec()),
+            ),
+            (Value::Integer(Integer::from(4)), options),
+            (
+                Value::Integer(Integer::from(5)),
+                Value::Integer(Integer::from(2048)),
+            ),
+            (
+                Value::Integer(Integer::from(6)),
+                Value::Array(vec![
+                    Value::Integer(Integer::from(i32::from(PIN_UV_AUTH_PROTOCOL_PQC))),
+                    Value::Integer(Integer::from(PIN_UV_AUTH_PROTOCOL_CLASSIC)),
+                ]),
+            ),
+            (
+                Value::Integer(Integer::from(8)),
+                Value::Integer(Integer::from(128)),
+            ),
+            (
+                Value::Integer(Integer::from(9)),
+                Value::Array(vec![Value::Text("usb".into())]),
+            ),
+            (Value::Integer(Integer::from(10)), algorithms),
+            (
+                Value::Integer(Integer::from(13)),
+                Value::Integer(Integer::from(PinState::MIN_PIN_LENGTH as u64)),
+            ),
+        ]);
+
+        let mut expected_bytes = Vec::new();
+        into_writer(&expected_map, &mut expected_bytes).expect("encode expected getInfo map");
+        assert_eq!(expected_bytes, &response[1..]);
+    }
+
+    #[test]
+    fn get_assertion_response_encoding_is_canonical() {
+        let mut app = CtapApp::new(TestClient::new(), [0x11; 16]);
+        let rp_id = "example.com";
+        let client_hash = vec![0x22; 32];
+        let pin_token = [0x33; 32];
+        app.pin_state.set_pin_uv_auth_token(pin_token);
+
+        let mut mac = HmacSha256::new_from_slice(&pin_token).expect("valid token");
+        mac.update(&client_hash);
+        let pin_uv_auth_param: Vec<u8> = mac.finalize().into_bytes()[..16].to_vec();
+
+        let user_id = vec![0x44, 0x55];
+        let user_name = "user".to_string();
+        let user_display = "User".to_string();
+        let credential_id = vec![0xAA, 0xBB, 0xCC];
+        let alg = CoseAlg::MLDSA44;
+        let (public_key, secret_key) = create_credential(alg);
+
+        app.stored_credentials.push(StoredCredential {
+            rp_id: rp_id.to_string(),
+            user_id: user_id.clone(),
+            user_name: Some(user_name.clone()),
+            user_display_name: Some(user_display.clone()),
+            alg: alg as i32,
+            credential_id: credential_id.clone(),
+            public_key: public_key.clone(),
+            secret_key: secret_key.0.clone(),
+            sign_count: 0,
+        });
+
+        let request_map = canonical_map(vec![
+            (
+                Value::Integer(Integer::from(1)),
+                Value::Text(rp_id.to_string()),
+            ),
+            (
+                Value::Integer(Integer::from(2)),
+                Value::Bytes(client_hash.clone()),
+            ),
+            (
+                Value::Integer(Integer::from(6)),
+                Value::Bytes(pin_uv_auth_param.clone()),
+            ),
+            (
+                Value::Integer(Integer::from(7)),
+                Value::Integer(Integer::from(PIN_UV_AUTH_PROTOCOL_CLASSIC)),
+            ),
+        ]);
+
+        let mut payload = Vec::new();
+        into_writer(&request_map, &mut payload).expect("serialize getAssertion request");
+        let response = app
+            .handle_get_assertion(&payload)
+            .expect("getAssertion succeeds");
+        assert_eq!(response[0], CTAP2_OK);
+
+        let sign_count = app.stored_credentials[0].sign_count;
+        assert_eq!(sign_count, 1);
+        let Value::Map(entries) =
+            from_reader(&response[1..]).expect("decode getAssertion response")
+        else {
+            panic!("response must be a map");
+        };
+        let mut credential_value = None;
+        let mut auth_data_value = None;
+        let mut signature_value = None;
+        let mut user_value = None;
+        for (key, value) in entries {
+            match key {
+                Value::Integer(int) => {
+                    let label: i128 = int.into();
+                    match label {
+                        1 => credential_value = Some(value),
+                        2 => auth_data_value = Some(value),
+                        3 => signature_value = Some(value),
+                        4 => user_value = Some(value),
+                        _ => {}
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        let credential_map = match credential_value.expect("credential present") {
+            Value::Map(map) => canonical_map(map),
+            _ => panic!("credential must be a map"),
+        };
+        let auth_data = auth_data_value.expect("authData present");
+        let signature = signature_value.expect("signature present");
+        let user_map = match user_value.expect("user present") {
+            Value::Map(map) => canonical_map(map),
+            _ => panic!("user must be a map"),
+        };
+
+        let expected_map = canonical_map(vec![
+            (Value::Integer(Integer::from(1)), credential_map),
+            (Value::Integer(Integer::from(2)), auth_data),
+            (Value::Integer(Integer::from(3)), signature),
+            (Value::Integer(Integer::from(4)), user_map),
+        ]);
+
+        let mut expected_bytes = Vec::new();
+        into_writer(&expected_map, &mut expected_bytes).expect("encode expected getAssertion map");
+        assert_eq!(expected_bytes, &response[1..]);
+    }
+
     fn request_classic_key_agreement(app: &mut CtapApp<TestClient>) -> Vec<(Value, Value)> {
-        let request = Value::Map(vec![
+        let request = canonical_map(vec![
             (
                 Value::Integer(Integer::from(1)),
                 Value::Integer(Integer::from(PIN_UV_AUTH_PROTOCOL_CLASSIC)),
@@ -479,7 +758,7 @@ mod tests {
         let y_field = point.y().expect("y coordinate present");
         let y_slice: &[u8] = y_field.as_ref();
         let y = y_slice.to_vec();
-        vec![
+        let mut entries = vec![
             (
                 Value::Integer(Integer::from(1)),
                 Value::Integer(Integer::from(PIN_UV_AUTH_PROTOCOL_CLASSIC)),
@@ -494,7 +773,9 @@ mod tests {
             ),
             (Value::Integer(Integer::from(-2)), Value::Bytes(x)),
             (Value::Integer(Integer::from(-3)), Value::Bytes(y)),
-        ]
+        ];
+        canonical_sort(&mut entries);
+        entries
     }
 
     fn derive_classic_session(
@@ -534,7 +815,7 @@ mod tests {
         let mut pin_mac = HmacSha256::new_from_slice(&set_keys.auth_key).expect("valid MAC key");
         pin_mac.update(&new_pin_enc);
         let pin_auth = pin_mac.finalize().into_bytes();
-        let set_pin_request = Value::Map(vec![
+        let set_pin_request = canonical_map(vec![
             (
                 Value::Integer(Integer::from(1)),
                 Value::Integer(Integer::from(PIN_UV_AUTH_PROTOCOL_CLASSIC)),
@@ -545,7 +826,7 @@ mod tests {
             ),
             (
                 Value::Integer(Integer::from(3)),
-                Value::Map(platform_entries.clone()),
+                canonical_map(platform_entries.clone()),
             ),
             (
                 Value::Integer(Integer::from(4)),
@@ -574,7 +855,7 @@ mod tests {
             HmacSha256::new_from_slice(&token_keys.auth_key).expect("valid MAC key");
         token_mac.update(&pin_hash_enc);
         let pin_hash_auth = token_mac.finalize().into_bytes();
-        let get_token_request = Value::Map(vec![
+        let get_token_request = canonical_map(vec![
             (
                 Value::Integer(Integer::from(1)),
                 Value::Integer(Integer::from(PIN_UV_AUTH_PROTOCOL_CLASSIC)),
@@ -585,7 +866,7 @@ mod tests {
             ),
             (
                 Value::Integer(Integer::from(3)),
-                Value::Map(platform_entries.clone()),
+                canonical_map(platform_entries.clone()),
             ),
             (
                 Value::Integer(Integer::from(4)),
@@ -637,11 +918,11 @@ mod tests {
         let mut mac = HmacSha256::new_from_slice(&pin_uv_auth_token).expect("valid token MAC");
         mac.update(&client_data_hash_mc);
         let pin_uv_auth_param_mc: Vec<u8> = mac.finalize().into_bytes()[..16].to_vec();
-        let rp = Value::Map(vec![(
+        let rp = canonical_map(vec![(
             Value::Text("id".into()),
             Value::Text("example.com".into()),
         )]);
-        let user = Value::Map(vec![
+        let user = canonical_map(vec![
             (Value::Text("id".into()), Value::Bytes(vec![0x01, 0x02])),
             (Value::Text("name".into()), Value::Text("example".into())),
             (
@@ -649,14 +930,14 @@ mod tests {
                 Value::Text("Example".into()),
             ),
         ]);
-        let pub_key_params = Value::Array(vec![Value::Map(vec![
+        let pub_key_params = Value::Array(vec![canonical_map(vec![
             (Value::Text("type".into()), Value::Text("public-key".into())),
             (
                 Value::Text("alg".into()),
                 Value::Integer(Integer::from(CoseAlg::MLDSA44 as i32)),
             ),
         ])]);
-        let make_credential = Value::Map(vec![
+        let make_credential = canonical_map(vec![
             (
                 Value::Integer(Integer::from(1)),
                 Value::Bytes(client_data_hash_mc.clone()),
@@ -701,7 +982,7 @@ mod tests {
         let mut mac = HmacSha256::new_from_slice(&pin_uv_auth_token).expect("valid token MAC");
         mac.update(&client_data_hash_ga);
         let pin_uv_auth_param_ga: Vec<u8> = mac.finalize().into_bytes()[..16].to_vec();
-        let get_assertion = Value::Map(vec![
+        let get_assertion = canonical_map(vec![
             (
                 Value::Integer(Integer::from(1)),
                 Value::Text("example.com".into()),
@@ -895,9 +1176,13 @@ where
                 }
             }
         };
-        let key_map = session.key_agreement_value();
+        let mut key_map = session.key_agreement_value();
+        if let Value::Map(mut entries) = key_map {
+            canonical_sort(&mut entries);
+            key_map = Value::Map(entries);
+        }
         self.pin_protocol_session = Some(session);
-        let response = Value::Map(vec![(Value::Integer(Integer::from(1)), key_map)]);
+        let response = canonical_map(vec![(Value::Integer(Integer::from(1)), key_map)]);
         let mut encoded = Vec::new();
         into_writer(&response, &mut encoded).map_err(|_| CTAP2_ERR_PROCESSING)?;
         let mut out = Vec::with_capacity(1 + encoded.len());
@@ -1028,7 +1313,7 @@ where
         let nonce = [0u8; 12];
         let encrypted = encrypt_pin_block(&keys, &nonce, &token, &transcript_hash);
         self.pin_state.set_pin_uv_auth_token(token);
-        let response = Value::Map(vec![
+        let response = canonical_map(vec![
             (Value::Integer(Integer::from(2)), Value::Bytes(encrypted)),
             (
                 Value::Integer(Integer::from(3)),
@@ -1171,7 +1456,7 @@ where
             Value::Bytes(self.aaguid.to_vec()),
         ));
 
-        let options = Value::Map(vec![
+        let options = canonical_map(vec![
             (Value::Text("rk".into()), Value::Bool(true)),
             (Value::Text("uv".into()), Value::Bool(true)),
             (Value::Text("up".into()), Value::Bool(true)),
@@ -1206,7 +1491,7 @@ where
         let algorithms = [-48, -49, -50]
             .into_iter()
             .map(|alg| {
-                Value::Map(vec![
+                canonical_map(vec![
                     (Value::Text("type".into()), Value::Text("public-key".into())),
                     (
                         Value::Text("alg".into()),
@@ -1220,6 +1505,7 @@ where
         let transports = Value::Array(vec![Value::Text("usb".into())]);
         map.push((Value::Integer(Integer::from(9)), transports));
 
+        canonical_sort(&mut map);
         let mut encoded = Vec::new();
         into_writer(&Value::Map(map), &mut encoded).map_err(|_| CTAP2_ERR_PROCESSING)?;
         let mut out = Vec::with_capacity(1 + encoded.len());
@@ -1396,7 +1682,7 @@ where
             initial_sign_count,
         );
         let signature = sign_challenge(alg, &secret_key, &auth_data, &client_hash);
-        let att_stmt = Value::Map(vec![
+        let att_stmt = canonical_map(vec![
             (
                 Value::Text("alg".into()),
                 Value::Integer(Integer::from(alg as i32)),
@@ -1404,7 +1690,7 @@ where
             (Value::Text("sig".into()), Value::Bytes(signature)),
         ]);
 
-        let response_map = vec![
+        let mut response_map = vec![
             (
                 Value::Integer(Integer::from(1)),
                 Value::Text("packed".into()),
@@ -1416,6 +1702,7 @@ where
             (Value::Integer(Integer::from(3)), att_stmt),
         ];
 
+        canonical_sort(&mut response_map);
         let mut encoded = Vec::new();
         into_writer(&Value::Map(response_map), &mut encoded).map_err(|_| CTAP2_ERR_PROCESSING)?;
         let mut out = Vec::with_capacity(1 + encoded.len());
@@ -1546,7 +1833,7 @@ where
         let signature = sign_challenge(alg, &signing_key, &auth_data, &client_hash);
         self.save_credentials(&credentials)?;
 
-        let credential_map = Value::Map(vec![
+        let credential_map = canonical_map(vec![
             (Value::Text("type".into()), Value::Text("public-key".into())),
             (
                 Value::Text("id".into()),
@@ -1561,15 +1848,16 @@ where
         if let Some(display) = user_display_name {
             user_entries.push((Value::Text("displayName".into()), Value::Text(display)));
         }
-        let user_map = Value::Map(user_entries);
+        let user_map = canonical_map(user_entries);
 
-        let response = vec![
+        let mut response = vec![
             (Value::Integer(Integer::from(1)), credential_map),
             (Value::Integer(Integer::from(2)), Value::Bytes(auth_data)),
             (Value::Integer(Integer::from(3)), Value::Bytes(signature)),
             (Value::Integer(Integer::from(4)), user_map),
         ];
 
+        canonical_sort(&mut response);
         let mut encoded = Vec::new();
         into_writer(&Value::Map(response), &mut encoded).map_err(|_| CTAP2_ERR_PROCESSING)?;
         let mut out = Vec::with_capacity(1 + encoded.len());
