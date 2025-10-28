@@ -1467,6 +1467,98 @@ fn credential_management_rejects_bound_token_for_rp_enumeration() {
     assert_eq!(result, Err(CTAP2_ERR_PIN_AUTH_INVALID));
 }
 
+#[test]
+fn client_pin_get_retries_reports_available_attempts() {
+    let mut app = CtapApp::new(TestClient::new(), [0x30; 16]);
+    let request = canonical_map(vec![
+        (
+            Value::Integer(Integer::from(1)),
+            Value::Integer(Integer::from(PIN_UV_AUTH_PROTOCOL_CLASSIC)),
+        ),
+        (
+            Value::Integer(Integer::from(2)),
+            Value::Integer(Integer::from(0x01)),
+        ),
+    ]);
+    let mut payload = Vec::new();
+    into_writer(&request, &mut payload).expect("serialize getRetries request");
+    let response = app
+        .handle_client_pin(&payload)
+        .expect("getRetries succeeds");
+    assert_eq!(response[0], CTAP2_OK);
+    let Value::Map(map) = from_reader(&response[1..]).expect("decode getRetries response") else {
+        panic!("response must be a map");
+    };
+    let retries: i128 = map
+        .iter()
+        .find(|(k, _)| *k == Value::Integer(Integer::from(0x03)))
+        .and_then(|(_, v)| match v {
+            Value::Integer(int) => Some(int.clone().into()),
+            _ => None,
+        })
+        .expect("retry count is present");
+    assert_eq!(retries, i128::from(MAX_PIN_RETRIES));
+    assert!(!map
+        .iter()
+        .any(|(k, _)| *k == Value::Integer(Integer::from(0x04))));
+}
+
+#[test]
+fn client_pin_get_retries_includes_power_cycle_state_when_blocked() {
+    let mut app = CtapApp::new(TestClient::new(), [0x31; 16]);
+    let mut pin_hash = [0x11; 16];
+    app.pin_state.set_pin(pin_hash);
+    let wrong = [0x22; 16];
+    for attempt in 0..MAX_PIN_FAILURES_BEFORE_BLOCK {
+        let result = app.pin_state.verify_pin_hash(&wrong);
+        if attempt + 1 < MAX_PIN_FAILURES_BEFORE_BLOCK {
+            assert_eq!(result, Err(CTAP2_ERR_PIN_INVALID));
+        } else {
+            assert_eq!(result, Err(CTAP2_ERR_PIN_AUTH_BLOCKED));
+        }
+    }
+    pin_hash.zeroize();
+
+    let request = canonical_map(vec![
+        (
+            Value::Integer(Integer::from(1)),
+            Value::Integer(Integer::from(PIN_UV_AUTH_PROTOCOL_CLASSIC)),
+        ),
+        (
+            Value::Integer(Integer::from(2)),
+            Value::Integer(Integer::from(0x01)),
+        ),
+    ]);
+    let mut payload = Vec::new();
+    into_writer(&request, &mut payload).expect("serialize getRetries request");
+    let response = app
+        .handle_client_pin(&payload)
+        .expect("getRetries succeeds");
+    assert_eq!(response[0], CTAP2_OK);
+    let Value::Map(map) = from_reader(&response[1..]).expect("decode getRetries response") else {
+        panic!("response must be a map");
+    };
+    let retries: i128 = map
+        .iter()
+        .find(|(k, _)| *k == Value::Integer(Integer::from(0x03)))
+        .and_then(|(_, v)| match v {
+            Value::Integer(int) => Some(int.clone().into()),
+            _ => None,
+        })
+        .expect("retry count is present");
+    let expected = MAX_PIN_RETRIES - MAX_PIN_FAILURES_BEFORE_BLOCK;
+    assert_eq!(retries, i128::from(expected));
+    let power_cycle = map
+        .iter()
+        .find(|(k, _)| *k == Value::Integer(Integer::from(0x04)))
+        .and_then(|(_, v)| match v {
+            Value::Bool(flag) => Some(*flag),
+            _ => None,
+        })
+        .expect("power cycle flag present");
+    assert!(power_cycle);
+}
+
 fn request_classic_key_agreement(app: &mut CtapApp<TestClient>) -> Vec<(Value, Value)> {
     let request = canonical_map(vec![
         (

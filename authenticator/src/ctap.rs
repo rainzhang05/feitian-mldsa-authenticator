@@ -207,6 +207,10 @@ impl PinState {
         self.pin_retries
     }
 
+    fn needs_power_cycle(&self) -> bool {
+        self.consecutive_failures >= MAX_PIN_FAILURES_BEFORE_BLOCK
+    }
+
     fn verify_pin_hash(&mut self, candidate: &[u8; 16]) -> Result<(), u8> {
         let Some(stored) = self.pin_hash else {
             return Err(CTAP2_ERR_PIN_NOT_SET);
@@ -1024,6 +1028,7 @@ where
         };
         let protocol = self.requested_pin_protocol(&map)?;
         match subcommand {
+            0x01 => self.client_pin_get_retries(),
             0x02 => self.client_pin_get_key_agreement(protocol),
             0x03 => self.client_pin_set_pin(protocol, &map),
             0x04 => self.client_pin_change_pin(protocol, &map),
@@ -1031,6 +1036,25 @@ where
             0x09 => self.client_pin_get_token_with_permissions(protocol, &map),
             _ => Err(CTAP1_ERR_INVALID_PARAMETER),
         }
+    }
+
+    fn client_pin_get_retries(&mut self) -> Result<Vec<u8>, u8> {
+        let mut entries = vec![(
+            Value::Integer(Integer::from(0x03)),
+            Value::Integer(Integer::from(u64::from(self.pin_state.retries()))),
+        )];
+
+        if self.pin_state.needs_power_cycle() {
+            entries.push((Value::Integer(Integer::from(0x04)), Value::Bool(true)));
+        }
+
+        let response = canonical_map(entries);
+        let mut encoded = Vec::new();
+        into_writer(&response, &mut encoded).map_err(|_| CTAP2_ERR_PROCESSING)?;
+        let mut out = Vec::with_capacity(1 + encoded.len());
+        out.push(CTAP2_OK);
+        out.extend_from_slice(&encoded);
+        Ok(out)
     }
 
     #[cfg(not(test))]
