@@ -128,6 +128,7 @@ const CTAP2_ERR_PIN_NOT_SET: u8 = 0x35;
 const CTAP2_ERR_PIN_POLICY_VIOLATION: u8 = 0x37;
 const CTAP2_ERR_PROCESSING: u8 = 0x21;
 const CTAP2_ERR_PUAT_REQUIRED: u8 = 0x36;
+const CTAP2_ERR_UNAUTHORIZED_PERMISSION: u8 = 0x40;
 
 const MAX_PIN_RETRIES: u8 = 8;
 const MAX_PIN_FAILURES_BEFORE_BLOCK: u8 = 3;
@@ -141,6 +142,10 @@ const SUPPORTED_PIN_UV_PROTOCOLS: [i32; 2] = [
     PIN_UV_AUTH_PROTOCOL_PQC as i32,
     PIN_UV_AUTH_PROTOCOL_CLASSIC,
 ];
+
+const PIN_PERMISSION_MC: u8 = 0x01;
+const PIN_PERMISSION_GA: u8 = 0x02;
+const PIN_PERMISSION_CM: u8 = 0x04;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct StoredCredential {
@@ -167,6 +172,8 @@ struct PinState {
     pin_retries: u8,
     consecutive_failures: u8,
     pin_uv_auth_token: Option<[u8; 32]>,
+    pin_uv_auth_permissions: u8,
+    pin_uv_auth_rp_id: Option<String>,
 }
 
 impl PinState {
@@ -178,6 +185,8 @@ impl PinState {
             pin_retries: MAX_PIN_RETRIES,
             consecutive_failures: 0,
             pin_uv_auth_token: None,
+            pin_uv_auth_permissions: 0,
+            pin_uv_auth_rp_id: None,
         }
     }
 
@@ -227,11 +236,17 @@ impl PinState {
         if let Some(mut token) = self.pin_uv_auth_token.take() {
             token.zeroize();
         }
+        self.pin_uv_auth_permissions = 0;
+        if let Some(mut rp_id) = self.pin_uv_auth_rp_id.take() {
+            rp_id.zeroize();
+        }
     }
 
-    fn set_pin_uv_auth_token(&mut self, token: [u8; 32]) {
+    fn set_pin_uv_auth_token(&mut self, token: [u8; 32], permissions: u8, rp_id: Option<String>) {
         self.clear_pin_uv_auth_token();
         self.pin_uv_auth_token = Some(token);
+        self.pin_uv_auth_permissions = permissions;
+        self.pin_uv_auth_rp_id = rp_id;
     }
 
     fn pin_uv_auth_token(&self) -> Option<[u8; 32]> {
@@ -240,6 +255,21 @@ impl PinState {
             copy.copy_from_slice(token);
             copy
         })
+    }
+
+    fn has_permission(&self, permission: u8) -> bool {
+        (self.pin_uv_auth_permissions & permission) != 0
+    }
+
+    fn permissions_rp_id(&self) -> Option<&str> {
+        self.pin_uv_auth_rp_id.as_deref()
+    }
+
+    fn set_permissions_rp_id(&mut self, rp_id: &str) {
+        if let Some(mut existing) = self.pin_uv_auth_rp_id.take() {
+            existing.zeroize();
+        }
+        self.pin_uv_auth_rp_id = Some(rp_id.to_string());
     }
 }
 
@@ -742,7 +772,8 @@ mod tests {
         let rp_id = "example.com";
         let client_hash = vec![0x22; 32];
         let pin_token = [0x33; 32];
-        app.pin_state.set_pin_uv_auth_token(pin_token);
+        app.pin_state
+            .set_pin_uv_auth_token(pin_token, PIN_PERMISSION_MC | PIN_PERMISSION_GA, None);
 
         let mut mac = HmacSha256::new_from_slice(&pin_token).expect("valid token");
         mac.update(&client_hash);
@@ -1022,7 +1053,8 @@ mod tests {
         let rp_id = "example.com";
         let client_hash = vec![0x22; 32];
         let pin_token = [0x33; 32];
-        app.pin_state.set_pin_uv_auth_token(pin_token);
+        app.pin_state
+            .set_pin_uv_auth_token(pin_token, PIN_PERMISSION_MC | PIN_PERMISSION_GA, None);
 
         let user_id = vec![0x01, 0x02];
         let credential_id = vec![0xAA, 0xBB, 0xCC];
@@ -1076,7 +1108,8 @@ mod tests {
         let mut app = CtapApp::new(TestClient::new(), [0xAA; 16]);
         let client_hash = vec![0xBB; 32];
         let pin_token = [0xCC; 32];
-        app.pin_state.set_pin_uv_auth_token(pin_token);
+        app.pin_state
+            .set_pin_uv_auth_token(pin_token, PIN_PERMISSION_MC | PIN_PERMISSION_GA, None);
 
         let mut mac = HmacSha256::new_from_slice(&pin_token).expect("valid token MAC");
         mac.update(&client_hash);
@@ -1207,7 +1240,8 @@ mod tests {
         app.pin_state.set_pin(pin_hash);
 
         let pin_token = [0x55; 32];
-        app.pin_state.set_pin_uv_auth_token(pin_token);
+        app.pin_state
+            .set_pin_uv_auth_token(pin_token, PIN_PERMISSION_MC | PIN_PERMISSION_GA, None);
 
         let client_hash = vec![0x77; 32];
         let mut mac = HmacSha256::new_from_slice(&pin_token).expect("valid token MAC");
@@ -1365,6 +1399,110 @@ mod tests {
     }
 
     #[test]
+    fn make_credential_requires_mc_permission() {
+        let mut app = CtapApp::new(TestClient::new(), [0x51; 16]);
+        let token = [0xAA; 32];
+        app.pin_state
+            .set_pin_uv_auth_token(token, PIN_PERMISSION_GA, None);
+
+        let client_hash = vec![0xBB; 32];
+        let mut mac = HmacSha256::new_from_slice(&token).expect("valid MAC key");
+        mac.update(&client_hash);
+        let pin_uv_auth_param: Vec<u8> = mac.finalize().into_bytes()[..16].to_vec();
+
+        let rp = canonical_map(vec![(
+            Value::Text("id".into()),
+            Value::Text("example.com".into()),
+        )]);
+        let user = canonical_map(vec![(Value::Text("id".into()), Value::Bytes(vec![0x01]))]);
+        let params = Value::Array(vec![canonical_map(vec![
+            (Value::Text("type".into()), Value::Text("public-key".into())),
+            (
+                Value::Text("alg".into()),
+                Value::Integer(Integer::from(CoseAlg::MLDSA44 as i32)),
+            ),
+        ])]);
+
+        let request = canonical_map(vec![
+            (
+                Value::Integer(Integer::from(1)),
+                Value::Bytes(client_hash.clone()),
+            ),
+            (Value::Integer(Integer::from(2)), rp),
+            (Value::Integer(Integer::from(3)), user),
+            (Value::Integer(Integer::from(4)), params),
+            (
+                Value::Integer(Integer::from(8)),
+                Value::Bytes(pin_uv_auth_param),
+            ),
+            (
+                Value::Integer(Integer::from(9)),
+                Value::Integer(Integer::from(PIN_UV_AUTH_PROTOCOL_CLASSIC)),
+            ),
+        ]);
+
+        let mut payload = Vec::new();
+        into_writer(&request, &mut payload).expect("serialize makeCredential request");
+        let result = app.handle_make_credential(&payload);
+        assert_eq!(result, Err(CTAP2_ERR_PIN_AUTH_INVALID));
+    }
+
+    #[test]
+    fn get_assertion_rejects_mismatched_rp_binding() {
+        let mut app = CtapApp::new(TestClient::new(), [0x52; 16]);
+        let token = [0xAB; 32];
+        app.pin_state
+            .set_pin_uv_auth_token(token, PIN_PERMISSION_GA, Some("other.com".into()));
+
+        let client_hash = vec![0xCC; 32];
+        let mut mac = HmacSha256::new_from_slice(&token).expect("valid MAC key");
+        mac.update(&client_hash);
+        let pin_uv_auth_param: Vec<u8> = mac.finalize().into_bytes()[..16].to_vec();
+
+        let credential_id = vec![0xAA, 0xBB];
+        let alg = CoseAlg::MLDSA44;
+        let (public_key, secret_key) = create_credential(alg);
+        app.stored_credentials.push(StoredCredential {
+            rp_id: "example.com".into(),
+            user_id: vec![0x01],
+            user_name: None,
+            user_display_name: None,
+            alg: alg as i32,
+            credential_id: credential_id.clone(),
+            public_key: public_key.clone(),
+            secret_key: secret_key.0.clone(),
+            cred_random_with_uv: None,
+            cred_random_without_uv: None,
+            cred_protect: Some(1),
+            sign_count: 0,
+        });
+
+        let request = canonical_map(vec![
+            (
+                Value::Integer(Integer::from(1)),
+                Value::Text("example.com".into()),
+            ),
+            (
+                Value::Integer(Integer::from(2)),
+                Value::Bytes(client_hash.clone()),
+            ),
+            (
+                Value::Integer(Integer::from(6)),
+                Value::Bytes(pin_uv_auth_param),
+            ),
+            (
+                Value::Integer(Integer::from(7)),
+                Value::Integer(Integer::from(PIN_UV_AUTH_PROTOCOL_CLASSIC)),
+            ),
+        ]);
+
+        let mut payload = Vec::new();
+        into_writer(&request, &mut payload).expect("serialize getAssertion request");
+        let result = app.handle_get_assertion(&payload);
+        assert_eq!(result, Err(CTAP2_ERR_PIN_AUTH_INVALID));
+    }
+
+    #[test]
     fn cred_protect_enforced_for_user_verification() {
         let mut app = CtapApp::new(TestClient::new(), [0x33; 16]);
         let rp_id = "example.com";
@@ -1435,7 +1573,8 @@ mod tests {
         assert_eq!(credential_id, vec![0xBB]);
 
         let pin_token = [0x66; 32];
-        app.pin_state.set_pin_uv_auth_token(pin_token);
+        app.pin_state
+            .set_pin_uv_auth_token(pin_token, PIN_PERMISSION_MC | PIN_PERMISSION_GA, None);
         let mut mac = HmacSha256::new_from_slice(&pin_token).expect("valid token");
         mac.update(&client_hash);
         let pin_uv_auth_param: Vec<u8> = mac.finalize().into_bytes()[..16].to_vec();
@@ -1499,7 +1638,8 @@ mod tests {
     fn credential_management_commands() {
         let mut app = CtapApp::new(TestClient::new(), [0x24; 16]);
         let token = [0x90; 32];
-        app.pin_state.set_pin_uv_auth_token(token);
+        app.pin_state
+            .set_pin_uv_auth_token(token, PIN_PERMISSION_CM, None);
 
         app.stored_credentials.push(StoredCredential {
             rp_id: "example.com".into(),
@@ -1767,6 +1907,62 @@ mod tests {
         assert_eq!(updated.user_name.as_deref(), Some("updated"));
     }
 
+    #[test]
+    fn credential_management_requires_cm_permission() {
+        let mut app = CtapApp::new(TestClient::new(), [0x25; 16]);
+        let token = [0x91; 32];
+        app.pin_state
+            .set_pin_uv_auth_token(token, PIN_PERMISSION_GA, None);
+
+        let request = canonical_map(vec![
+            (
+                Value::Integer(Integer::from(1)),
+                Value::Integer(Integer::from(0x01)),
+            ),
+            (
+                Value::Integer(Integer::from(3)),
+                Value::Integer(Integer::from(PIN_UV_AUTH_PROTOCOL_CLASSIC)),
+            ),
+            (
+                Value::Integer(Integer::from(4)),
+                Value::Bytes(cm_pin_param(&token, 0x01, None)),
+            ),
+        ]);
+
+        let mut payload = Vec::new();
+        into_writer(&request, &mut payload).expect("serialize metadata request");
+        let result = app.handle_credential_management(&payload);
+        assert_eq!(result, Err(CTAP2_ERR_PIN_AUTH_INVALID));
+    }
+
+    #[test]
+    fn credential_management_rejects_bound_token_for_rp_enumeration() {
+        let mut app = CtapApp::new(TestClient::new(), [0x26; 16]);
+        let token = [0x92; 32];
+        app.pin_state
+            .set_pin_uv_auth_token(token, PIN_PERMISSION_CM, Some("example.com".into()));
+
+        let request = canonical_map(vec![
+            (
+                Value::Integer(Integer::from(1)),
+                Value::Integer(Integer::from(0x02)),
+            ),
+            (
+                Value::Integer(Integer::from(3)),
+                Value::Integer(Integer::from(PIN_UV_AUTH_PROTOCOL_CLASSIC)),
+            ),
+            (
+                Value::Integer(Integer::from(4)),
+                Value::Bytes(cm_pin_param(&token, 0x02, None)),
+            ),
+        ]);
+
+        let mut payload = Vec::new();
+        into_writer(&request, &mut payload).expect("serialize enumerate RPs request");
+        let result = app.handle_credential_management(&payload);
+        assert_eq!(result, Err(CTAP2_ERR_PIN_AUTH_INVALID));
+    }
+
     fn request_classic_key_agreement(app: &mut CtapApp<TestClient>) -> Vec<(Value, Value)> {
         let request = canonical_map(vec![
             (
@@ -1863,6 +2059,128 @@ mod tests {
         let keys = crate::derive_pin_uv_session_keys(shared_bytes.as_ref(), &transcript_hash);
         let platform_entries = classic_platform_key_entries(&platform_public);
         (keys, transcript_hash, platform_entries)
+    }
+
+    #[test]
+    fn client_pin_token_with_permissions_sets_metadata() {
+        let mut app = CtapApp::new(TestClient::new(), [0xA7; 16]);
+        let pin = b"1234";
+        let mut hasher = Sha256::new();
+        hasher.update(pin);
+        let digest = hasher.finalize();
+        let mut pin_hash = [0u8; 16];
+        pin_hash.copy_from_slice(&digest[..16]);
+        app.pin_state.set_pin(pin_hash);
+
+        let auth_entries = request_classic_key_agreement(&mut app);
+        let platform_secret =
+            P256SecretKey::from_slice(&[0x33; 32]).expect("valid platform secret");
+        let (keys, transcript_hash, platform_entries) =
+            derive_classic_session(&auth_entries, &platform_secret);
+        let nonce = [0u8; 12];
+        let pin_hash_enc = crate::encrypt_pin_block(&keys, &nonce, &digest[..16], &transcript_hash);
+        let mut mac = HmacSha256::new_from_slice(&keys.auth_key).expect("valid MAC key");
+        mac.update(&pin_hash_enc);
+        let pin_auth = mac.finalize().into_bytes();
+
+        let request_map = canonical_map(vec![
+            (
+                Value::Integer(Integer::from(1)),
+                Value::Integer(Integer::from(PIN_UV_AUTH_PROTOCOL_CLASSIC)),
+            ),
+            (
+                Value::Integer(Integer::from(2)),
+                Value::Integer(Integer::from(0x09)),
+            ),
+            (
+                Value::Integer(Integer::from(3)),
+                canonical_map(platform_entries.clone()),
+            ),
+            (
+                Value::Integer(Integer::from(4)),
+                Value::Bytes(pin_auth[..16].to_vec()),
+            ),
+            (
+                Value::Integer(Integer::from(6)),
+                Value::Bytes(pin_hash_enc.clone()),
+            ),
+            (
+                Value::Integer(Integer::from(9)),
+                Value::Integer(Integer::from(
+                    (PIN_PERMISSION_MC | PIN_PERMISSION_GA) as i32,
+                )),
+            ),
+            (
+                Value::Integer(Integer::from(10)),
+                Value::Text("example.com".into()),
+            ),
+        ]);
+        let mut payload = Vec::new();
+        into_writer(&request_map, &mut payload).expect("serialize permissions request");
+        let response = app
+            .handle_client_pin(&payload)
+            .expect("getPinUvAuthTokenWithPermissions succeeds");
+        assert_eq!(response[0], CTAP2_OK);
+        assert!(app.pin_state.has_permission(PIN_PERMISSION_MC));
+        assert!(app.pin_state.has_permission(PIN_PERMISSION_GA));
+        assert!(!app.pin_state.has_permission(PIN_PERMISSION_CM));
+        assert_eq!(app.pin_state.permissions_rp_id(), Some("example.com"));
+    }
+
+    #[test]
+    fn client_pin_token_with_permissions_requires_rp_id() {
+        let mut app = CtapApp::new(TestClient::new(), [0xA8; 16]);
+        let pin = b"1234";
+        let mut hasher = Sha256::new();
+        hasher.update(pin);
+        let digest = hasher.finalize();
+        let mut pin_hash = [0u8; 16];
+        pin_hash.copy_from_slice(&digest[..16]);
+        app.pin_state.set_pin(pin_hash);
+
+        let auth_entries = request_classic_key_agreement(&mut app);
+        let platform_secret =
+            P256SecretKey::from_slice(&[0x44; 32]).expect("valid platform secret");
+        let (keys, transcript_hash, platform_entries) =
+            derive_classic_session(&auth_entries, &platform_secret);
+        let nonce = [0u8; 12];
+        let pin_hash_enc = crate::encrypt_pin_block(&keys, &nonce, &digest[..16], &transcript_hash);
+        let mut mac = HmacSha256::new_from_slice(&keys.auth_key).expect("valid MAC key");
+        mac.update(&pin_hash_enc);
+        let pin_auth = mac.finalize().into_bytes();
+
+        let request_map = canonical_map(vec![
+            (
+                Value::Integer(Integer::from(1)),
+                Value::Integer(Integer::from(PIN_UV_AUTH_PROTOCOL_CLASSIC)),
+            ),
+            (
+                Value::Integer(Integer::from(2)),
+                Value::Integer(Integer::from(0x09)),
+            ),
+            (
+                Value::Integer(Integer::from(3)),
+                canonical_map(platform_entries.clone()),
+            ),
+            (
+                Value::Integer(Integer::from(4)),
+                Value::Bytes(pin_auth[..16].to_vec()),
+            ),
+            (
+                Value::Integer(Integer::from(6)),
+                Value::Bytes(pin_hash_enc.clone()),
+            ),
+            (
+                Value::Integer(Integer::from(9)),
+                Value::Integer(Integer::from(
+                    (PIN_PERMISSION_MC | PIN_PERMISSION_GA) as i32,
+                )),
+            ),
+        ]);
+        let mut payload = Vec::new();
+        into_writer(&request_map, &mut payload).expect("serialize permissions request");
+        let result = app.handle_client_pin(&payload);
+        assert_eq!(result, Err(CTAP2_ERR_MISSING_PARAMETER));
     }
 
     #[test]
@@ -2045,6 +2363,7 @@ mod tests {
             .handle_make_credential(&payload)
             .expect("makeCredential succeeds");
         assert_eq!(response[0], CTAP2_OK);
+        assert_eq!(app.pin_state.permissions_rp_id(), Some("example.com"));
 
         // Use the stored token to get an assertion via the classic protocol path.
         let client_data_hash_ga = vec![0xBB; 32];
@@ -2076,6 +2395,7 @@ mod tests {
             .expect("getAssertion succeeds");
         assert_eq!(response[0], CTAP2_OK);
         assert!(app.pin_state.pin_uv_auth_token().is_some());
+        assert_eq!(app.pin_state.permissions_rp_id(), Some("example.com"));
     }
 }
 
@@ -2357,10 +2677,12 @@ where
         Ok(vec![CTAP2_OK])
     }
 
-    fn client_pin_get_token(
+    fn client_pin_get_token_common(
         &mut self,
         protocol: PinProtocol,
         map: &[(Value, Value)],
+        permissions: u8,
+        rp_id: Option<String>,
     ) -> Result<Vec<u8>, u8> {
         if !self.pin_state.is_set() {
             return Err(CTAP2_ERR_PIN_NOT_SET);
@@ -2397,7 +2719,8 @@ where
         token.copy_from_slice(random.as_slice());
         let nonce = [0u8; 12];
         let encrypted = encrypt_pin_block(&keys, &nonce, &token, &transcript_hash);
-        self.pin_state.set_pin_uv_auth_token(token);
+        self.pin_state
+            .set_pin_uv_auth_token(token, permissions, rp_id);
         let response = canonical_map(vec![
             (Value::Integer(Integer::from(2)), Value::Bytes(encrypted)),
             (
@@ -2411,6 +2734,142 @@ where
         out.push(CTAP2_OK);
         out.extend_from_slice(&encoded);
         Ok(out)
+    }
+
+    fn client_pin_get_token_legacy(
+        &mut self,
+        protocol: PinProtocol,
+        map: &[(Value, Value)],
+    ) -> Result<Vec<u8>, u8> {
+        if Self::map_get(map, Value::Integer(Integer::from(9))).is_some()
+            || Self::map_get(map, Value::Integer(Integer::from(10))).is_some()
+        {
+            return Err(CTAP1_ERR_INVALID_PARAMETER);
+        }
+        let permissions = PIN_PERMISSION_MC | PIN_PERMISSION_GA;
+        self.client_pin_get_token_common(protocol, map, permissions, None)
+    }
+
+    fn client_pin_get_token_with_permissions(
+        &mut self,
+        protocol: PinProtocol,
+        map: &[(Value, Value)],
+    ) -> Result<Vec<u8>, u8> {
+        let permissions_value = match Self::map_get(map, Value::Integer(Integer::from(9))) {
+            Some(Value::Integer(value)) => {
+                let int_value: i128 = value.clone().into();
+                if int_value <= 0 || int_value > u8::MAX as i128 {
+                    return Err(CTAP1_ERR_INVALID_PARAMETER);
+                }
+                int_value as u8
+            }
+            Some(_) => return Err(CTAP1_ERR_INVALID_PARAMETER),
+            None => return Err(CTAP2_ERR_MISSING_PARAMETER),
+        };
+        if permissions_value == 0 {
+            return Err(CTAP1_ERR_INVALID_PARAMETER);
+        }
+
+        let rp_id_value = match Self::map_get(map, Value::Integer(Integer::from(10))) {
+            Some(Value::Text(text)) => Some(text.clone()),
+            Some(_) => return Err(CTAP2_ERR_INVALID_CBOR),
+            None => None,
+        };
+
+        if permissions_value & (PIN_PERMISSION_MC | PIN_PERMISSION_GA) != 0 && rp_id_value.is_none()
+        {
+            return Err(CTAP2_ERR_MISSING_PARAMETER);
+        }
+        if permissions_value & PIN_PERMISSION_CM != 0 && rp_id_value.is_some() {
+            return Err(CTAP1_ERR_INVALID_PARAMETER);
+        }
+
+        let supported_permissions = PIN_PERMISSION_MC | PIN_PERMISSION_GA | PIN_PERMISSION_CM;
+        if permissions_value & !supported_permissions != 0 {
+            return Err(CTAP2_ERR_UNAUTHORIZED_PERMISSION);
+        }
+
+        let assigned_permissions = permissions_value & supported_permissions;
+        self.client_pin_get_token_common(protocol, map, assigned_permissions, rp_id_value)
+    }
+
+    fn ensure_pin_token_permission_for_rp(
+        &mut self,
+        permission: u8,
+        rp_id: &str,
+    ) -> Result<(), u8> {
+        if !self.pin_state.has_permission(permission) {
+            return Err(CTAP2_ERR_PIN_AUTH_INVALID);
+        }
+        match self.pin_state.permissions_rp_id() {
+            Some(existing) => {
+                if existing != rp_id {
+                    return Err(CTAP2_ERR_PIN_AUTH_INVALID);
+                }
+            }
+            None => self.pin_state.set_permissions_rp_id(rp_id),
+        }
+        Ok(())
+    }
+
+    fn ensure_pin_token_permission_for_cm(
+        &mut self,
+        subcommand: u8,
+        params: Option<&[(Value, Value)]>,
+    ) -> Result<(), u8> {
+        if !self.pin_state.has_permission(PIN_PERMISSION_CM) {
+            return Err(CTAP2_ERR_PIN_AUTH_INVALID);
+        }
+        let Some(binding) = self
+            .pin_state
+            .permissions_rp_id()
+            .map(|value| value.to_string())
+        else {
+            return Ok(());
+        };
+        match subcommand {
+            0x01 | 0x02 | 0x03 => Err(CTAP2_ERR_PIN_AUTH_INVALID),
+            0x04 => {
+                let params = params.ok_or(CTAP2_ERR_MISSING_PARAMETER)?;
+                let rp_hash = match Self::map_get(params, Value::Integer(Integer::from(1))) {
+                    Some(Value::Bytes(bytes)) => bytes,
+                    _ => return Err(CTAP2_ERR_MISSING_PARAMETER),
+                };
+                if Self::cm_hash_rp_id(&binding) == *rp_hash {
+                    Ok(())
+                } else {
+                    Err(CTAP2_ERR_PIN_AUTH_INVALID)
+                }
+            }
+            0x05 => match self.cred_mgmt_state.current_rp.as_deref() {
+                Some(current) if current == binding => Ok(()),
+                _ => Err(CTAP2_ERR_PIN_AUTH_INVALID),
+            },
+            0x06 | 0x07 => {
+                let params = params.ok_or(CTAP2_ERR_MISSING_PARAMETER)?;
+                let descriptor = match Self::map_get(params, Value::Integer(Integer::from(2))) {
+                    Some(Value::Map(map)) => map,
+                    _ => return Err(CTAP2_ERR_MISSING_PARAMETER),
+                };
+                let Some(Value::Bytes(id)) = Self::map_get(descriptor, Value::Text("id".into()))
+                else {
+                    return Err(CTAP2_ERR_MISSING_PARAMETER);
+                };
+                let credentials = self.load_credentials()?;
+                let Some(credential) = credentials
+                    .iter()
+                    .find(|cred| cred.credential_id == *id)
+                else {
+                    return Err(CTAP2_ERR_NO_CREDENTIALS);
+                };
+                if credential.rp_id == binding {
+                    Ok(())
+                } else {
+                    Err(CTAP2_ERR_PIN_AUTH_INVALID)
+                }
+            }
+            _ => Ok(()),
+        }
     }
 
     fn handle_client_pin(&mut self, payload: &[u8]) -> Result<Vec<u8>, u8> {
@@ -2432,7 +2891,8 @@ where
             0x02 => self.client_pin_get_key_agreement(protocol),
             0x03 => self.client_pin_set_pin(protocol, &map),
             0x04 => self.client_pin_change_pin(protocol, &map),
-            0x05 | 0x09 => self.client_pin_get_token(protocol, &map),
+            0x05 => self.client_pin_get_token_legacy(protocol, &map),
+            0x09 => self.client_pin_get_token_with_permissions(protocol, &map),
             _ => Err(CTAP1_ERR_INVALID_PARAMETER),
         }
     }
@@ -2964,6 +3424,11 @@ where
             return Err(CTAP2_ERR_PIN_AUTH_INVALID);
         }
 
+        self.ensure_pin_token_permission_for_cm(
+            subcommand,
+            subcommand_params.as_ref().map(|params| params.as_slice()),
+        )?;
+
         let response_entries = match subcommand {
             0x01 => Some(self.cm_get_metadata()?),
             0x02 => Some(self.cm_enumerate_rps_begin()?),
@@ -3181,6 +3646,10 @@ where
             if !uv_verified {
                 return Err(CTAP2_ERR_PIN_AUTH_INVALID);
             }
+        }
+
+        if uv_verified {
+            self.ensure_pin_token_permission_for_rp(PIN_PERMISSION_MC, &rp_id)?;
         }
 
         let cred_protect_value = cred_protect_requested.unwrap_or(1);
@@ -3404,6 +3873,10 @@ where
             _ => {
                 return Err(CTAP2_ERR_MISSING_PARAMETER);
             }
+        }
+
+        if user_verified {
+            self.ensure_pin_token_permission_for_rp(PIN_PERMISSION_GA, &rp_id)?;
         }
 
         let user_present = true;
