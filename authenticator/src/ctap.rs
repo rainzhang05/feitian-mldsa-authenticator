@@ -1639,7 +1639,10 @@ where
             (Value::Text("up".into()), Value::Bool(true)),
             (Value::Text("credMgmt".into()), Value::Bool(true)),
             (Value::Text("pinUvAuthToken".into()), Value::Bool(true)),
-            (Value::Text("clientPin".into()), Value::Bool(true)),
+            (
+                Value::Text("clientPin".into()),
+                Value::Bool(self.pin_state.is_set()),
+            ),
         ]);
         map.push((Value::Integer(Integer::from(4)), options));
 

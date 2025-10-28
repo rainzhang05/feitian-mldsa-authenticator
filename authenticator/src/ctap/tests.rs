@@ -157,11 +157,11 @@ fn classic_key_agreement_value_is_canonical() {
     assert_eq!(actual_bytes, expected_bytes);
 }
 
-#[test]
-fn get_info_response_encoding_is_canonical() {
-    let aaguid = [0xAB; 16];
-    let mut app = CtapApp::new(TestClient::new(), aaguid);
-
+fn assert_get_info_response(
+    app: &mut CtapApp<TestClient>,
+    aaguid: [u8; 16],
+    expected_client_pin: bool,
+) {
     let response = app.handle_get_info().expect("getInfo succeeds");
     assert_eq!(response[0], CTAP2_OK);
 
@@ -170,7 +170,10 @@ fn get_info_response_encoding_is_canonical() {
         (Value::Text("up".into()), Value::Bool(true)),
         (Value::Text("credMgmt".into()), Value::Bool(true)),
         (Value::Text("pinUvAuthToken".into()), Value::Bool(true)),
-        (Value::Text("clientPin".into()), Value::Bool(true)),
+        (
+            Value::Text("clientPin".into()),
+            Value::Bool(expected_client_pin),
+        ),
     ]);
 
     let extensions = Value::Array(vec![
@@ -242,6 +245,24 @@ fn get_info_response_encoding_is_canonical() {
     let mut expected_bytes = Vec::new();
     into_writer(&expected_map, &mut expected_bytes).expect("encode expected getInfo map");
     assert_eq!(expected_bytes, &response[1..]);
+}
+
+#[test]
+fn get_info_response_encoding_is_canonical_with_pin_unset() {
+    let aaguid = [0xAB; 16];
+    let mut app = CtapApp::new(TestClient::new(), aaguid);
+
+    assert_get_info_response(&mut app, aaguid, false);
+}
+
+#[test]
+fn get_info_response_encoding_is_canonical_with_pin_set() {
+    let aaguid = [0xAB; 16];
+    let mut app = CtapApp::new(TestClient::new(), aaguid);
+    let pin_hash = [0x11; 16];
+    app.pin_state.set_pin(pin_hash);
+
+    assert_get_info_response(&mut app, aaguid, true);
 }
 
 #[test]
