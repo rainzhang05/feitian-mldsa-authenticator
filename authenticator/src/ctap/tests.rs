@@ -888,6 +888,15 @@ fn make_credential_self_attestation_without_attestation_key() {
     let Value::Map(entries) = from_reader(&response[1..]).expect("decode response map") else {
         panic!("response must be a map");
     };
+    let fmt_value = entries
+        .iter()
+        .find(|(k, _)| *k == Value::Integer(Integer::from(1)))
+        .and_then(|(_, v)| match v {
+            Value::Text(text) => Some(text.clone()),
+            _ => None,
+        })
+        .expect("fmt present");
+    assert_eq!(fmt_value, "packed");
     let att_stmt_entries = entries
         .iter()
         .find(|(k, _)| *k == Value::Integer(Integer::from(3)))
@@ -931,6 +940,77 @@ fn make_credential_self_attestation_without_attestation_key() {
         })
         .expect("sig value present");
     assert!(!signature_bytes.is_empty());
+}
+
+#[test]
+fn make_credential_can_suppress_attestation() {
+    let mut app = CtapApp::new(TestClient::new(), [0xDD; 16]);
+    app.suppress_attestation(true);
+
+    let client_hash = vec![0x33; 32];
+    let rp = canonical_map(vec![(
+        Value::Text("id".into()),
+        Value::Text("example.com".into()),
+    )]);
+    let user = canonical_map(vec![(Value::Text("id".into()), Value::Bytes(vec![0x02]))]);
+    let params = Value::Array(vec![canonical_map(vec![
+        (Value::Text("type".into()), Value::Text("public-key".into())),
+        (
+            Value::Text("alg".into()),
+            Value::Integer(Integer::from(CoseAlg::MLDSA44 as i32)),
+        ),
+    ])]);
+
+    let make_credential = canonical_map(vec![
+        (
+            Value::Integer(Integer::from(1)),
+            Value::Bytes(client_hash.clone()),
+        ),
+        (Value::Integer(Integer::from(2)), rp),
+        (Value::Integer(Integer::from(3)), user),
+        (Value::Integer(Integer::from(4)), params),
+    ]);
+
+    let mut payload = Vec::new();
+    into_writer(&make_credential, &mut payload).expect("serialize makeCredential request");
+    let response = app
+        .handle_make_credential(&payload)
+        .expect("makeCredential succeeds");
+    assert_eq!(response[0], CTAP2_OK);
+    assert_eq!(app.stored_credentials.len(), 1);
+
+    let Value::Map(entries) = from_reader(&response[1..]).expect("decode response map") else {
+        panic!("response must be a map");
+    };
+    let fmt_value = entries
+        .iter()
+        .find(|(k, _)| *k == Value::Integer(Integer::from(1)))
+        .and_then(|(_, v)| match v {
+            Value::Text(text) => Some(text.clone()),
+            _ => None,
+        })
+        .expect("fmt present");
+    assert_eq!(fmt_value, "none");
+
+    let auth_data = entries
+        .iter()
+        .find(|(k, _)| *k == Value::Integer(Integer::from(2)))
+        .and_then(|(_, v)| match v {
+            Value::Bytes(bytes) => Some(bytes.clone()),
+            _ => None,
+        })
+        .expect("authData present");
+    assert!(!auth_data.is_empty());
+
+    let att_stmt_entries = entries
+        .iter()
+        .find(|(k, _)| *k == Value::Integer(Integer::from(3)))
+        .and_then(|(_, v)| match v {
+            Value::Map(map) => Some(map.clone()),
+            _ => None,
+        })
+        .expect("attStmt present");
+    assert!(att_stmt_entries.is_empty());
 }
 
 #[test]

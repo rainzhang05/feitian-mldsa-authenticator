@@ -564,6 +564,7 @@ pub struct CtapApp<C> {
     pin_state: PinState,
     pin_protocol_session: Option<PinProtocolSession>,
     platform_declined_pqc: bool,
+    suppress_attestation: bool,
     cred_mgmt_state: CredentialManagementState,
     pending_assertion: Option<PendingAssertion>,
     attestation_private_key: Option<Vec<u8>>,
@@ -583,6 +584,7 @@ where
             pin_state: PinState::new(),
             pin_protocol_session: None,
             platform_declined_pqc: false,
+            suppress_attestation: false,
             cred_mgmt_state: CredentialManagementState::new(),
             pending_assertion: None,
             attestation_private_key: None,
@@ -596,6 +598,10 @@ where
         }
 
         app
+    }
+
+    pub fn suppress_attestation(&mut self, suppress: bool) {
+        self.suppress_attestation = suppress;
     }
     fn verify_pin_auth(
         protocol: PinProtocol,
@@ -2033,36 +2039,38 @@ where
             initial_sign_count,
             extension_bytes.as_deref(),
         );
-        let attestation_result = self.attestation_signature(&auth_data, &client_hash)?;
-        let att_stmt = if let Some((signature, certificate_chain)) = attestation_result {
-            let entries = vec![
-                (
-                    Value::Text("alg".into()),
-                    Value::Integer(Integer::from(COSE_ALG_ES256)),
-                ),
-                (Value::Text("sig".into()), Value::Bytes(signature)),
-                (
-                    Value::Text("x5c".into()),
-                    Value::Array(certificate_chain.into_iter().map(Value::Bytes).collect()),
-                ),
-            ];
-            canonical_map(entries)
+        let (attestation_format, att_stmt) = if self.suppress_attestation {
+            (Value::Text("none".into()), Value::Map(Vec::new()))
         } else {
-            let signature = sign_challenge(alg, &secret_key, &auth_data, &client_hash);
-            canonical_map(vec![
-                (
-                    Value::Text("alg".into()),
-                    Value::Integer(Integer::from(alg as i32)),
-                ),
-                (Value::Text("sig".into()), Value::Bytes(signature)),
-            ])
+            let attestation_result = self.attestation_signature(&auth_data, &client_hash)?;
+            let att_stmt = if let Some((signature, certificate_chain)) = attestation_result {
+                let entries = vec![
+                    (
+                        Value::Text("alg".into()),
+                        Value::Integer(Integer::from(COSE_ALG_ES256)),
+                    ),
+                    (Value::Text("sig".into()), Value::Bytes(signature)),
+                    (
+                        Value::Text("x5c".into()),
+                        Value::Array(certificate_chain.into_iter().map(Value::Bytes).collect()),
+                    ),
+                ];
+                canonical_map(entries)
+            } else {
+                let signature = sign_challenge(alg, &secret_key, &auth_data, &client_hash);
+                canonical_map(vec![
+                    (
+                        Value::Text("alg".into()),
+                        Value::Integer(Integer::from(alg as i32)),
+                    ),
+                    (Value::Text("sig".into()), Value::Bytes(signature)),
+                ])
+            };
+            (Value::Text("packed".into()), att_stmt)
         };
 
         let mut response_map = vec![
-            (
-                Value::Integer(Integer::from(1)),
-                Value::Text("packed".into()),
-            ),
+            (Value::Integer(Integer::from(1)), attestation_format),
             (
                 Value::Integer(Integer::from(2)),
                 Value::Bytes(auth_data.clone()),
