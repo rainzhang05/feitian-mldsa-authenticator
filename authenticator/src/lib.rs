@@ -1,30 +1,3 @@
-//! Skeleton Trussed application integrating the ML-DSA signature scheme.
-//!
-//! This module outlines how a FIDO2 authenticator could incorporate
-//! ML-DSA-44/65/87 into credential creation and assertion.  It does not
-//! implement a full CTAP2 state machine or the WebAuthn attestation
-//! protocol; instead it sketches the key data structures and helper
-//! functions needed to plug ML-DSA into an existing Trussed runner.
-//!
-//! A real authenticator must:
-//!
-//! * Implement the CTAP2 commands `get_info`, `make_credential` and
-//!   `get_assertion`, marshalling and unmarshalling CBOR requests.
-//! * Persist credentials in a secure store.
-//! * Handle user verification (PIN, biometric or presence) as per the
-//!   requirements of FIDO2.
-//! * Advertise the supported COSE algorithm identifiers in the response
-//!   to `get_info`.  Draft ML-DSA WebAuthn integration assigns temporary
-//!   IDs -48, -49 and -50 for ML-DSA-44, ML-DSA-65 and ML-DSA-87
-//!   respectively【980082228157822†L243-L256】.
-//!
-//! The functions in this file demonstrate how to:
-//!
-//! * Map a COSE algorithm ID to an ML-DSA parameter set.
-//! * Generate a keypair via the `trussed-mldsa` wrapper.
-//! * Construct a COSE_Key for the public key using CBOR encoding.
-//! * Sign a challenge using the selected parameter set.
-//!
 #[allow(deprecated)]
 use aes_gcm::aead::{generic_array::GenericArray, Aead, KeyInit, Payload};
 use aes_gcm::Aes256Gcm;
