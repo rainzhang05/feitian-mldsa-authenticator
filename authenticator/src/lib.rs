@@ -126,9 +126,9 @@ impl TryFrom<i32> for CoseAlg {
 /// Map a COSE algorithm identifier to the corresponding ML-DSA parameter set.
 pub fn paramset_from_alg(alg: CoseAlg) -> ParamSet {
     match alg {
-        CoseAlg::MLDSA44 => ParamSet::MLDsa44,
-        CoseAlg::MLDSA65 => ParamSet::MLDsa65,
-        CoseAlg::MLDSA87 => ParamSet::MLDsa87,
+        CoseAlg::MLDSA44 => ParamSet::MLDSA44,
+        CoseAlg::MLDSA65 => ParamSet::MLDSA65,
+        CoseAlg::MLDSA87 => ParamSet::MLDSA87,
     }
 }
 
@@ -169,9 +169,9 @@ pub(crate) fn cose_akp_key_map(alg_id: i32, public_key: &[u8]) -> Value {
 /// * **-1**: the raw public key bytes.
 pub fn cose_public_key(ps: ParamSet, pk: &PublicKey) -> Vec<u8> {
     let alg_id = match ps {
-        ParamSet::MLDsa44 => CoseAlg::MLDSA44 as i32,
-        ParamSet::MLDsa65 => CoseAlg::MLDSA65 as i32,
-        ParamSet::MLDsa87 => CoseAlg::MLDSA87 as i32,
+        ParamSet::MLDSA44 => CoseAlg::MLDSA44 as i32,
+        ParamSet::MLDSA65 => CoseAlg::MLDSA65 as i32,
+        ParamSet::MLDSA87 => CoseAlg::MLDSA87 as i32,
     };
     let mut out = Vec::new();
     let map = cose_akp_key_map(alg_id, &pk.0);
@@ -221,7 +221,7 @@ mod tests {
     fn cose_public_key_canonical_encoding_matches_fixture() {
         let pk_bytes = vec![0xDE, 0xAD, 0xBE, 0xEF];
         let pk = PublicKey(pk_bytes.clone());
-        let cose = cose_public_key(ParamSet::MLDsa44, &pk);
+        let cose = cose_public_key(ParamSet::MLDSA44, &pk);
         let expected = vec![
             0xA3, 0x01, 0x07, 0x03, 0x38, 0x2F, 0x20, 0x44, 0xDE, 0xAD, 0xBE, 0xEF,
         ];

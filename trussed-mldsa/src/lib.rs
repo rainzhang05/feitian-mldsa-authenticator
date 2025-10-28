@@ -68,9 +68,9 @@ extern "C" {
 /// ML-DSA parameter sets supported by this wrapper.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ParamSet {
-    MLDsa44,
-    MLDsa65,
-    MLDsa87,
+    MLDSA44,
+    MLDSA65,
+    MLDSA87,
 }
 
 /// Public key wrapper.
@@ -90,9 +90,9 @@ impl Drop for SecretKey {
 /// Return the buffer lengths required by the parameter set.
 fn lengths(ps: ParamSet) -> (usize, usize, usize) {
     match ps {
-        ParamSet::MLDsa44 => (1312, 2560, 2420),
-        ParamSet::MLDsa65 => (1952, 4032, 3309),
-        ParamSet::MLDsa87 => (2592, 4896, 4627),
+        ParamSet::MLDSA44 => (1312, 2560, 2420),
+        ParamSet::MLDSA65 => (1952, 4032, 3309),
+        ParamSet::MLDSA87 => (2592, 4896, 4627),
     }
 }
 
@@ -103,7 +103,7 @@ pub fn keypair(ps: ParamSet) -> (PublicKey, SecretKey) {
     let mut sk = vec![0u8; sk_len];
     unsafe {
         let rc = match ps {
-            ParamSet::MLDsa44 => {
+            ParamSet::MLDSA44 => {
                 #[cfg(feature = "mldsa44")]
                 {
                     OQS_SIG_ml_dsa_44_keypair(pk.as_mut_ptr(), sk.as_mut_ptr())
@@ -113,7 +113,7 @@ pub fn keypair(ps: ParamSet) -> (PublicKey, SecretKey) {
                     panic!("feature mldsa44 is not enabled");
                 }
             }
-            ParamSet::MLDsa65 => {
+            ParamSet::MLDSA65 => {
                 #[cfg(feature = "mldsa65")]
                 {
                     OQS_SIG_ml_dsa_65_keypair(pk.as_mut_ptr(), sk.as_mut_ptr())
@@ -123,7 +123,7 @@ pub fn keypair(ps: ParamSet) -> (PublicKey, SecretKey) {
                     panic!("feature mldsa65 is not enabled");
                 }
             }
-            ParamSet::MLDsa87 => {
+            ParamSet::MLDSA87 => {
                 #[cfg(feature = "mldsa87")]
                 {
                     OQS_SIG_ml_dsa_87_keypair(pk.as_mut_ptr(), sk.as_mut_ptr())
@@ -146,7 +146,7 @@ pub fn sign(ps: ParamSet, sk: &SecretKey, message: &[u8]) -> Vec<u8> {
     let mut actual_len: usize = sig_len;
     unsafe {
         let rc = match ps {
-            ParamSet::MLDsa44 => {
+            ParamSet::MLDSA44 => {
                 #[cfg(feature = "mldsa44")]
                 {
                     OQS_SIG_ml_dsa_44_sign(
@@ -162,7 +162,7 @@ pub fn sign(ps: ParamSet, sk: &SecretKey, message: &[u8]) -> Vec<u8> {
                     panic!("feature mldsa44 is not enabled");
                 }
             }
-            ParamSet::MLDsa65 => {
+            ParamSet::MLDSA65 => {
                 #[cfg(feature = "mldsa65")]
                 {
                     OQS_SIG_ml_dsa_65_sign(
@@ -178,7 +178,7 @@ pub fn sign(ps: ParamSet, sk: &SecretKey, message: &[u8]) -> Vec<u8> {
                     panic!("feature mldsa65 is not enabled");
                 }
             }
-            ParamSet::MLDsa87 => {
+            ParamSet::MLDSA87 => {
                 #[cfg(feature = "mldsa87")]
                 {
                     OQS_SIG_ml_dsa_87_sign(
@@ -205,7 +205,7 @@ pub fn sign(ps: ParamSet, sk: &SecretKey, message: &[u8]) -> Vec<u8> {
 pub fn verify(ps: ParamSet, pk: &PublicKey, message: &[u8], signature: &[u8]) -> bool {
     unsafe {
         let rc = match ps {
-            ParamSet::MLDsa44 => {
+            ParamSet::MLDSA44 => {
                 #[cfg(feature = "mldsa44")]
                 {
                     OQS_SIG_ml_dsa_44_verify(
@@ -221,7 +221,7 @@ pub fn verify(ps: ParamSet, pk: &PublicKey, message: &[u8], signature: &[u8]) ->
                     panic!("feature mldsa44 is not enabled");
                 }
             }
-            ParamSet::MLDsa65 => {
+            ParamSet::MLDSA65 => {
                 #[cfg(feature = "mldsa65")]
                 {
                     OQS_SIG_ml_dsa_65_verify(
@@ -237,7 +237,7 @@ pub fn verify(ps: ParamSet, pk: &PublicKey, message: &[u8], signature: &[u8]) ->
                     panic!("feature mldsa65 is not enabled");
                 }
             }
-            ParamSet::MLDsa87 => {
+            ParamSet::MLDSA87 => {
                 #[cfg(feature = "mldsa87")]
                 {
                     OQS_SIG_ml_dsa_87_verify(
@@ -275,16 +275,16 @@ mod tests {
 
     #[test]
     fn mldsa44_roundtrip() {
-        roundtrip(ParamSet::MLDsa44);
+        roundtrip(ParamSet::MLDSA44);
     }
 
     #[test]
     fn mldsa65_roundtrip() {
-        roundtrip(ParamSet::MLDsa65);
+        roundtrip(ParamSet::MLDSA65);
     }
 
     #[test]
     fn mldsa87_roundtrip() {
-        roundtrip(ParamSet::MLDsa87);
+        roundtrip(ParamSet::MLDSA87);
     }
 }
