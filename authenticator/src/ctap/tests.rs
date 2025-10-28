@@ -6,7 +6,9 @@ use ciborium::{
 };
 use core::task::Poll;
 use p256::{
-    ecdh::diffie_hellman, EncodedPoint, PublicKey as P256PublicKey, SecretKey as P256SecretKey,
+    ecdh::diffie_hellman,
+    ecdsa::{signature::Signer, Signature as P256EcdsaSignature, SigningKey},
+    EncodedPoint, PublicKey as P256PublicKey, SecretKey as P256SecretKey,
 };
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
@@ -735,6 +737,200 @@ fn make_credential_includes_extensions() {
         })
         .expect("credProtect extension present");
     assert_eq!(cred_protect_value, 3);
+}
+
+#[test]
+fn make_credential_uses_attestation_certificate_when_available() {
+    let mut app = CtapApp::new(TestClient::new(), [0xAB; 16]);
+    let att_key_bytes = vec![0x13; 32];
+    let secret = P256SecretKey::from_slice(&att_key_bytes).expect("valid attestation key");
+    let certificate = vec![0x30, 0x82, 0x00, 0x01];
+    app.attestation_private_key = Some(att_key_bytes.clone());
+    app.attestation_certificate_chain = Some(vec![certificate.clone()]);
+
+    let client_hash = vec![0x11; 32];
+    let rp = canonical_map(vec![(
+        Value::Text("id".into()),
+        Value::Text("example.com".into()),
+    )]);
+    let user = canonical_map(vec![(Value::Text("id".into()), Value::Bytes(vec![0xAA]))]);
+    let params = Value::Array(vec![canonical_map(vec![
+        (Value::Text("type".into()), Value::Text("public-key".into())),
+        (
+            Value::Text("alg".into()),
+            Value::Integer(Integer::from(CoseAlg::MLDSA44 as i32)),
+        ),
+    ])]);
+
+    let make_credential = canonical_map(vec![
+        (
+            Value::Integer(Integer::from(1)),
+            Value::Bytes(client_hash.clone()),
+        ),
+        (Value::Integer(Integer::from(2)), rp),
+        (Value::Integer(Integer::from(3)), user),
+        (Value::Integer(Integer::from(4)), params),
+    ]);
+
+    let mut payload = Vec::new();
+    into_writer(&make_credential, &mut payload).expect("serialize makeCredential request");
+    let response = app
+        .handle_make_credential(&payload)
+        .expect("makeCredential succeeds");
+    assert_eq!(response[0], CTAP2_OK);
+
+    let Value::Map(entries) = from_reader(&response[1..]).expect("decode response map") else {
+        panic!("response must be a map");
+    };
+    let auth_data = entries
+        .iter()
+        .find(|(k, _)| *k == Value::Integer(Integer::from(2)))
+        .and_then(|(_, v)| match v {
+            Value::Bytes(bytes) => Some(bytes.clone()),
+            _ => None,
+        })
+        .expect("authData present");
+    let att_stmt_entries = entries
+        .iter()
+        .find(|(k, _)| *k == Value::Integer(Integer::from(3)))
+        .and_then(|(_, v)| match v {
+            Value::Map(map) => Some(map.clone()),
+            _ => None,
+        })
+        .expect("attStmt present");
+
+    let alg_value = att_stmt_entries
+        .iter()
+        .find(|(k, _)| match k {
+            Value::Text(text) => text == "alg",
+            _ => false,
+        })
+        .and_then(|(_, v)| match v {
+            Value::Integer(int) => Some(int.clone()),
+            _ => None,
+        })
+        .expect("alg value present");
+    let alg_i128: i128 = alg_value.into();
+    assert_eq!(alg_i128, i128::from(COSE_ALG_ES256));
+
+    let signature_bytes = att_stmt_entries
+        .iter()
+        .find(|(k, _)| match k {
+            Value::Text(text) => text == "sig",
+            _ => false,
+        })
+        .and_then(|(_, v)| match v {
+            Value::Bytes(bytes) => Some(bytes.clone()),
+            _ => None,
+        })
+        .expect("sig value present");
+    let cert_chain = att_stmt_entries
+        .iter()
+        .find(|(k, _)| match k {
+            Value::Text(text) => text == "x5c",
+            _ => false,
+        })
+        .and_then(|(_, v)| match v {
+            Value::Array(values) => Some(values.clone()),
+            _ => None,
+        })
+        .expect("x5c present");
+    assert_eq!(cert_chain.len(), 1);
+    assert_eq!(
+        cert_chain[0],
+        Value::Bytes(certificate.clone()),
+        "certificate chain returned",
+    );
+
+    let signing_key = SigningKey::from(secret);
+    let mut message = Vec::with_capacity(auth_data.len() + client_hash.len());
+    message.extend_from_slice(&auth_data);
+    message.extend_from_slice(&client_hash);
+    let expected_signature: P256EcdsaSignature = signing_key.sign(&message);
+    let expected_der = expected_signature.to_der();
+    assert_eq!(signature_bytes.as_slice(), expected_der.as_bytes());
+}
+
+#[test]
+fn make_credential_self_attestation_without_attestation_key() {
+    let mut app = CtapApp::new(TestClient::new(), [0xCD; 16]);
+    let client_hash = vec![0x22; 32];
+    let rp = canonical_map(vec![(
+        Value::Text("id".into()),
+        Value::Text("example.com".into()),
+    )]);
+    let user = canonical_map(vec![(Value::Text("id".into()), Value::Bytes(vec![0x01]))]);
+    let params = Value::Array(vec![canonical_map(vec![
+        (Value::Text("type".into()), Value::Text("public-key".into())),
+        (
+            Value::Text("alg".into()),
+            Value::Integer(Integer::from(CoseAlg::MLDSA44 as i32)),
+        ),
+    ])]);
+
+    let make_credential = canonical_map(vec![
+        (
+            Value::Integer(Integer::from(1)),
+            Value::Bytes(client_hash.clone()),
+        ),
+        (Value::Integer(Integer::from(2)), rp),
+        (Value::Integer(Integer::from(3)), user),
+        (Value::Integer(Integer::from(4)), params),
+    ]);
+
+    let mut payload = Vec::new();
+    into_writer(&make_credential, &mut payload).expect("serialize makeCredential request");
+    let response = app
+        .handle_make_credential(&payload)
+        .expect("makeCredential succeeds");
+    assert_eq!(response[0], CTAP2_OK);
+
+    let Value::Map(entries) = from_reader(&response[1..]).expect("decode response map") else {
+        panic!("response must be a map");
+    };
+    let att_stmt_entries = entries
+        .iter()
+        .find(|(k, _)| *k == Value::Integer(Integer::from(3)))
+        .and_then(|(_, v)| match v {
+            Value::Map(map) => Some(map.clone()),
+            _ => None,
+        })
+        .expect("attStmt present");
+
+    assert!(
+        att_stmt_entries.iter().all(|(k, _)| match k {
+            Value::Text(text) => text != "x5c",
+            _ => true,
+        }),
+        "x5c should be absent for self attestation",
+    );
+
+    let alg_value = att_stmt_entries
+        .iter()
+        .find(|(k, _)| match k {
+            Value::Text(text) => text == "alg",
+            _ => false,
+        })
+        .and_then(|(_, v)| match v {
+            Value::Integer(int) => Some(int.clone()),
+            _ => None,
+        })
+        .expect("alg value present");
+    let alg_i128: i128 = alg_value.into();
+    assert_eq!(alg_i128, i128::from(CoseAlg::MLDSA44 as i32));
+
+    let signature_bytes = att_stmt_entries
+        .iter()
+        .find(|(k, _)| match k {
+            Value::Text(text) => text == "sig",
+            _ => false,
+        })
+        .and_then(|(_, v)| match v {
+            Value::Bytes(bytes) => Some(bytes.clone()),
+            _ => None,
+        })
+        .expect("sig value present");
+    assert!(!signature_bytes.is_empty());
 }
 
 #[test]

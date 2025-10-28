@@ -18,8 +18,10 @@ use ciborium::{
 use ctaphid_app::{App, Command, Error};
 use hmac::{Hmac, Mac};
 use p256::{
-    ecdh::diffie_hellman, elliptic_curve::sec1::ToEncodedPoint, EncodedPoint,
-    PublicKey as P256PublicKey, SecretKey as P256SecretKey,
+    ecdh::diffie_hellman,
+    ecdsa::{signature::Signer, Signature as P256EcdsaSignature, SigningKey},
+    elliptic_curve::sec1::ToEncodedPoint,
+    EncodedPoint, PublicKey as P256PublicKey, SecretKey as P256SecretKey,
 };
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -136,8 +138,12 @@ const MAX_PIN_FAILURES_BEFORE_BLOCK: u8 = 3;
 
 type HmacSha256 = Hmac<Sha256>;
 
+const COSE_ALG_ES256: i32 = -7;
+
 #[cfg(not(test))]
 const CREDENTIAL_STORE_PATH: &str = "credentials.cbor";
+#[cfg(not(test))]
+const ATTESTATION_STORE_PATH: &str = "attestation.cbor";
 const PIN_UV_AUTH_PROTOCOL_CLASSIC_V1: i32 = 1;
 const PIN_UV_AUTH_PROTOCOL_CLASSIC_V2: i32 = 2;
 const PIN_UV_AUTH_PROTOCOL_CLASSIC: i32 = PIN_UV_AUTH_PROTOCOL_CLASSIC_V2;
@@ -168,6 +174,12 @@ struct StoredCredential {
     #[serde(default)]
     cred_protect: Option<u8>,
     sign_count: u32,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct StoredAttestation {
+    private_key: Vec<u8>,
+    certificate_chain: Vec<Vec<u8>>,
 }
 
 #[derive(Debug)]
@@ -554,13 +566,18 @@ pub struct CtapApp<C> {
     platform_declined_pqc: bool,
     cred_mgmt_state: CredentialManagementState,
     pending_assertion: Option<PendingAssertion>,
+    attestation_private_key: Option<Vec<u8>>,
+    attestation_certificate_chain: Option<Vec<Vec<u8>>>,
     #[cfg(test)]
     stored_credentials: Vec<StoredCredential>,
 }
 
-impl<C> CtapApp<C> {
+impl<C> CtapApp<C>
+where
+    C: TrussedClient + FilesystemClient + CryptoClient,
+{
     pub fn new(client: C, aaguid: [u8; 16]) -> Self {
-        Self {
+        let mut app = Self {
             client,
             aaguid,
             pin_state: PinState::new(),
@@ -568,16 +585,18 @@ impl<C> CtapApp<C> {
             platform_declined_pqc: false,
             cred_mgmt_state: CredentialManagementState::new(),
             pending_assertion: None,
+            attestation_private_key: None,
+            attestation_certificate_chain: None,
             #[cfg(test)]
             stored_credentials: Vec::new(),
-        }
-    }
-}
+        };
 
-impl<C> CtapApp<C>
-where
-    C: TrussedClient + FilesystemClient + CryptoClient,
-{
+        if app.load_attestation_material().is_err() {
+            app.clear_attestation_material();
+        }
+
+        app
+    }
     fn verify_pin_auth(
         protocol: PinProtocol,
         keys: &PinUvSessionKeys,
@@ -1118,9 +1137,86 @@ where
         Ok(out)
     }
 
+    fn clear_attestation_material(&mut self) {
+        if let Some(mut key) = self.attestation_private_key.take() {
+            key.zeroize();
+        }
+        self.attestation_certificate_chain = None;
+    }
+
     #[cfg(not(test))]
     fn store_path() -> Result<PathBuf, u8> {
         PathBuf::try_from(CREDENTIAL_STORE_PATH).map_err(|_| CTAP2_ERR_PROCESSING)
+    }
+
+    #[cfg(not(test))]
+    fn attestation_store_path() -> Result<PathBuf, u8> {
+        PathBuf::try_from(ATTESTATION_STORE_PATH).map_err(|_| CTAP2_ERR_PROCESSING)
+    }
+
+    #[cfg(not(test))]
+    fn load_attestation_material(&mut self) -> Result<(), u8> {
+        let path = Self::attestation_store_path()?;
+        match try_syscall!(self.client.read_file(Location::Internal, path.clone())) {
+            Ok(reply) => {
+                let data = reply.data.as_slice();
+                if data.is_empty() {
+                    self.clear_attestation_material();
+                    return Ok(());
+                }
+
+                let stored: StoredAttestation =
+                    from_reader(data).map_err(|_| CTAP2_ERR_INVALID_CBOR)?;
+                if stored.private_key.is_empty()
+                    || stored.certificate_chain.is_empty()
+                    || stored.private_key.len() != 32
+                {
+                    self.clear_attestation_material();
+                    return Err(CTAP2_ERR_INVALID_CBOR);
+                }
+
+                self.clear_attestation_material();
+                self.attestation_private_key = Some(stored.private_key);
+                self.attestation_certificate_chain = Some(stored.certificate_chain);
+                Ok(())
+            }
+            Err(_) => {
+                self.clear_attestation_material();
+                Ok(())
+            }
+        }
+    }
+
+    #[cfg(test)]
+    fn load_attestation_material(&mut self) -> Result<(), u8> {
+        Ok(())
+    }
+
+    fn attestation_signature(
+        &self,
+        auth_data: &[u8],
+        client_hash: &[u8],
+    ) -> Result<Option<(Vec<u8>, Vec<Vec<u8>>)>, u8> {
+        let (key_bytes, chain) = match (
+            self.attestation_private_key.as_ref(),
+            self.attestation_certificate_chain.as_ref(),
+        ) {
+            (Some(key), Some(chain)) if !chain.is_empty() => (key, chain),
+            _ => return Ok(None),
+        };
+
+        if key_bytes.len() != 32 {
+            return Err(CTAP2_ERR_PROCESSING);
+        }
+
+        let secret_key = P256SecretKey::from_slice(key_bytes).map_err(|_| CTAP2_ERR_PROCESSING)?;
+        let signing_key = SigningKey::from(secret_key);
+        let mut message = Vec::with_capacity(auth_data.len() + client_hash.len());
+        message.extend_from_slice(auth_data);
+        message.extend_from_slice(client_hash);
+        let signature: P256EcdsaSignature = signing_key.sign(&message);
+        let der = signature.to_der();
+        Ok(Some((der.as_bytes().to_vec(), chain.clone())))
     }
 
     #[cfg(not(test))]
@@ -1936,14 +2032,30 @@ where
             initial_sign_count,
             extension_bytes.as_deref(),
         );
-        let signature = sign_challenge(alg, &secret_key, &auth_data, &client_hash);
-        let att_stmt = canonical_map(vec![
-            (
-                Value::Text("alg".into()),
-                Value::Integer(Integer::from(alg as i32)),
-            ),
-            (Value::Text("sig".into()), Value::Bytes(signature)),
-        ]);
+        let attestation_result = self.attestation_signature(&auth_data, &client_hash)?;
+        let att_stmt = if let Some((signature, certificate_chain)) = attestation_result {
+            let entries = vec![
+                (
+                    Value::Text("alg".into()),
+                    Value::Integer(Integer::from(COSE_ALG_ES256)),
+                ),
+                (Value::Text("sig".into()), Value::Bytes(signature)),
+                (
+                    Value::Text("x5c".into()),
+                    Value::Array(certificate_chain.into_iter().map(Value::Bytes).collect()),
+                ),
+            ];
+            canonical_map(entries)
+        } else {
+            let signature = sign_challenge(alg, &secret_key, &auth_data, &client_hash);
+            canonical_map(vec![
+                (
+                    Value::Text("alg".into()),
+                    Value::Integer(Integer::from(alg as i32)),
+                ),
+                (Value::Text("sig".into()), Value::Bytes(signature)),
+            ])
+        };
 
         let mut response_map = vec![
             (
