@@ -659,7 +659,6 @@ mod tests {
 
         let options = canonical_map(vec![
             (Value::Text("rk".into()), Value::Bool(true)),
-            (Value::Text("uv".into()), Value::Bool(true)),
             (Value::Text("up".into()), Value::Bool(true)),
             (Value::Text("credMgmt".into()), Value::Bool(true)),
             (Value::Text("pinUvAuthToken".into()), Value::Bool(true)),
@@ -2850,7 +2849,6 @@ where
 
         let options = canonical_map(vec![
             (Value::Text("rk".into()), Value::Bool(true)),
-            (Value::Text("uv".into()), Value::Bool(true)),
             (Value::Text("up".into()), Value::Bool(true)),
             (Value::Text("credMgmt".into()), Value::Bool(true)),
             (Value::Text("pinUvAuthToken".into()), Value::Bool(true)),
@@ -3130,10 +3128,9 @@ where
                 return Err(CTAP2_ERR_INVALID_OPTION);
             }
             if let Some(Value::Bool(uv)) = Self::map_get(options, Value::Text("uv".into())) {
-                if !uv {
-                    return Err(CTAP2_ERR_INVALID_OPTION);
+                if *uv {
+                    uv_requested = true;
                 }
-                uv_requested = true;
             }
         }
 
