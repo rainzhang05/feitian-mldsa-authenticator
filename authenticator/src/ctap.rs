@@ -78,6 +78,7 @@ const CTAP_CMD_MAKE_CREDENTIAL: u8 = 0x01;
 const CTAP_CMD_GET_ASSERTION: u8 = 0x02;
 const CTAP_CMD_GET_INFO: u8 = 0x04;
 const CTAP_CMD_CLIENT_PIN: u8 = 0x06;
+const CTAP_CMD_GET_NEXT_ASSERTION: u8 = 0x08;
 
 const CTAP2_OK: u8 = 0x00;
 const CTAP2_ERR_INVALID_CBOR: u8 = 0x12;
@@ -87,6 +88,7 @@ const CTAP2_ERR_UNSUPPORTED_ALGORITHM: u8 = 0x26;
 const CTAP2_ERR_INVALID_OPTION: u8 = 0x2C;
 const CTAP2_ERR_NO_CREDENTIALS: u8 = 0x2E;
 const CTAP1_ERR_INVALID_PARAMETER: u8 = 0x2D;
+const CTAP2_ERR_NOT_ALLOWED: u8 = 0x27;
 const CTAP2_ERR_PIN_INVALID: u8 = 0x31;
 const CTAP2_ERR_PIN_BLOCKED: u8 = 0x32;
 const CTAP2_ERR_PIN_AUTH_INVALID: u8 = 0x33;
@@ -119,6 +121,15 @@ struct StoredCredential {
     public_key: Vec<u8>,
     secret_key: Vec<u8>,
     sign_count: u32,
+}
+
+struct PendingAssertion {
+    credentials: Vec<StoredCredential>,
+    matching_indices: Vec<usize>,
+    next_index: usize,
+    client_data_hash: Vec<u8>,
+    rp_id: String,
+    uv_verified: bool,
 }
 
 #[derive(Debug)]
@@ -698,6 +709,370 @@ mod tests {
         assert_eq!(expected_bytes, &response[1..]);
     }
 
+    #[test]
+    fn get_next_assertion_iterates_credentials_without_allow_list() {
+        let rp_id = "example.com";
+        let client_hash = vec![0xAA; 32];
+
+        let mut app = CtapApp::new(TestClient::new(), [0xA5; 16]);
+        let pin_token = [0x11; 32];
+        app.pin_state.set_pin_uv_auth_token(pin_token);
+
+        let mut expected_ids = Vec::new();
+        for user in 0..3 {
+            let user_id = vec![user];
+            let (public_key, secret_key) = create_credential(CoseAlg::MLDSA44);
+            let credential_id = vec![0x10 + user, 0x20 + user];
+            expected_ids.push(credential_id.clone());
+            app.stored_credentials.push(StoredCredential {
+                rp_id: rp_id.to_string(),
+                user_id: user_id.clone(),
+                user_name: Some(format!("user{user}")),
+                user_display_name: Some(format!("User {user}")),
+                alg: CoseAlg::MLDSA44 as i32,
+                credential_id,
+                public_key: public_key.clone(),
+                secret_key: secret_key.0.clone(),
+                sign_count: 0,
+            });
+        }
+
+        let mut mac = HmacSha256::new_from_slice(&pin_token).expect("valid token");
+        mac.update(&client_hash);
+        let pin_uv_auth_param: Vec<u8> = mac.finalize().into_bytes()[..16].to_vec();
+
+        let request_map = canonical_map(vec![
+            (
+                Value::Integer(Integer::from(1)),
+                Value::Text(rp_id.to_string()),
+            ),
+            (
+                Value::Integer(Integer::from(2)),
+                Value::Bytes(client_hash.clone()),
+            ),
+            (
+                Value::Integer(Integer::from(6)),
+                Value::Bytes(pin_uv_auth_param.clone()),
+            ),
+            (
+                Value::Integer(Integer::from(7)),
+                Value::Integer(Integer::from(PIN_UV_AUTH_PROTOCOL_CLASSIC)),
+            ),
+        ]);
+
+        let mut payload = Vec::new();
+        into_writer(&request_map, &mut payload).expect("serialize getAssertion request");
+
+        let response = app
+            .handle_get_assertion(&payload)
+            .expect("getAssertion succeeds");
+        assert_eq!(response[0], CTAP2_OK);
+
+        let Value::Map(entries) = from_reader(&response[1..]).expect("decode getAssertion response")
+        else {
+            panic!("response must be a map");
+        };
+
+        let mut returned_id = None;
+        let mut credential_count = None;
+        for (key, value) in entries {
+            if let Value::Integer(label) = key {
+                let label_value: i128 = label.into();
+                match label_value {
+                    1 => {
+                        let Value::Map(cred_map) = value else {
+                            panic!("credential must be a map");
+                        };
+                        for (cred_key, cred_value) in cred_map {
+                            if cred_key == Value::Text("id".into()) {
+                                if let Value::Bytes(id) = cred_value {
+                                    returned_id = Some(id);
+                                }
+                            }
+                        }
+                    }
+                    5 => {
+                        if let Value::Integer(count) = value {
+                            credential_count = Some(count);
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+
+        assert_eq!(returned_id.expect("credential id present"), expected_ids[0]);
+        let count_value: i128 = credential_count.expect("credential count present").into();
+        assert_eq!(count_value, 3);
+
+        let pending = app
+            .pending_assertion
+            .as_ref()
+            .expect("pending assertion cached");
+        assert_eq!(pending.matching_indices.len(), 3);
+        assert_eq!(pending.next_index, 1);
+
+        let next_response = app
+            .handle_get_next_assertion()
+            .expect("getNextAssertion returns second credential");
+        assert_eq!(next_response[0], CTAP2_OK);
+        let Value::Map(next_entries) =
+            from_reader(&next_response[1..]).expect("decode next assertion response")
+        else {
+            panic!("next response must be a map");
+        };
+        let mut next_id = None;
+        let mut saw_count = false;
+        for (key, value) in next_entries {
+            if let Value::Integer(label) = key {
+                let label_value: i128 = label.into();
+                match label_value {
+                    1 => {
+                        let Value::Map(cred_map) = value else {
+                            panic!("credential must be a map");
+                        };
+                        for (cred_key, cred_value) in cred_map {
+                            if cred_key == Value::Text("id".into()) {
+                                if let Value::Bytes(id) = cred_value {
+                                    next_id = Some(id);
+                                }
+                            }
+                        }
+                    }
+                    5 => saw_count = true,
+                    _ => {}
+                }
+            }
+        }
+        assert_eq!(next_id.expect("second credential id present"), expected_ids[1]);
+        assert!(!saw_count, "numberOfCredentials must not appear in getNextAssertion");
+
+        let pending = app
+            .pending_assertion
+            .as_ref()
+            .expect("pending assertion remains");
+        assert_eq!(pending.next_index, 2);
+
+        let final_response = app
+            .handle_get_next_assertion()
+            .expect("getNextAssertion returns third credential");
+        assert_eq!(final_response[0], CTAP2_OK);
+        let Value::Map(final_entries) =
+            from_reader(&final_response[1..]).expect("decode final assertion response")
+        else {
+            panic!("final response must be a map");
+        };
+        let mut final_id = None;
+        for (key, value) in final_entries {
+            if let Value::Integer(label) = key {
+                if i128::from(label.clone()) == 1 {
+                    let Value::Map(cred_map) = value else {
+                        panic!("credential must be a map");
+                    };
+                    for (cred_key, cred_value) in cred_map {
+                        if cred_key == Value::Text("id".into()) {
+                            if let Value::Bytes(id) = cred_value {
+                                final_id = Some(id);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        assert_eq!(final_id.expect("third credential id present"), expected_ids[2]);
+        assert!(app.pending_assertion.is_none(), "state clears after final credential");
+
+        let err = app.handle_get_next_assertion();
+        assert_eq!(err, Err(CTAP2_ERR_NOT_ALLOWED));
+
+        for credential in &app.stored_credentials {
+            assert_eq!(credential.sign_count, 1);
+        }
+    }
+
+    #[test]
+    fn get_assertion_with_allow_list_resets_state_on_new_request() {
+        let rp_id = "example.org";
+        let client_hash = vec![0xBB; 32];
+
+        let mut app = CtapApp::new(TestClient::new(), [0x44; 16]);
+        let pin_token = [0x22; 32];
+        app.pin_state.set_pin_uv_auth_token(pin_token);
+
+        let mut credential_ids = Vec::new();
+        for user in 0..3 {
+            let (public_key, secret_key) = create_credential(CoseAlg::MLDSA44);
+            let credential_id = vec![0x30 + user, 0x40 + user];
+            credential_ids.push(credential_id.clone());
+            app.stored_credentials.push(StoredCredential {
+                rp_id: rp_id.to_string(),
+                user_id: vec![user + 1],
+                user_name: Some(format!("person{user}")),
+                user_display_name: Some(format!("Person {user}")),
+                alg: CoseAlg::MLDSA44 as i32,
+                credential_id,
+                public_key: public_key.clone(),
+                secret_key: secret_key.0.clone(),
+                sign_count: 0,
+            });
+        }
+
+        let allow_list_order = vec![credential_ids[2].clone(), credential_ids[0].clone()];
+
+        let allow_list = Value::Array(
+            allow_list_order
+                .iter()
+                .map(|id| {
+                    canonical_map(vec![
+                        (
+                            Value::Text("type".into()),
+                            Value::Text("public-key".into()),
+                        ),
+                        (Value::Text("id".into()), Value::Bytes(id.clone())),
+                    ])
+                })
+                .collect(),
+        );
+
+        let mut mac = HmacSha256::new_from_slice(&pin_token).expect("valid token");
+        mac.update(&client_hash);
+        let pin_uv_auth_param: Vec<u8> = mac.finalize().into_bytes()[..16].to_vec();
+
+        let request_map = canonical_map(vec![
+            (
+                Value::Integer(Integer::from(1)),
+                Value::Text(rp_id.to_string()),
+            ),
+            (
+                Value::Integer(Integer::from(2)),
+                Value::Bytes(client_hash.clone()),
+            ),
+            (
+                Value::Integer(Integer::from(3)),
+                allow_list.clone(),
+            ),
+            (
+                Value::Integer(Integer::from(6)),
+                Value::Bytes(pin_uv_auth_param.clone()),
+            ),
+            (
+                Value::Integer(Integer::from(7)),
+                Value::Integer(Integer::from(PIN_UV_AUTH_PROTOCOL_CLASSIC)),
+            ),
+        ]);
+
+        let mut payload = Vec::new();
+        into_writer(&request_map, &mut payload).expect("serialize getAssertion request");
+
+        let response = app
+            .handle_get_assertion(&payload)
+            .expect("getAssertion succeeds");
+        assert_eq!(response[0], CTAP2_OK);
+
+        let Value::Map(entries) = from_reader(&response[1..]).expect("decode getAssertion response")
+        else {
+            panic!("response must be a map");
+        };
+
+        let mut first_id = None;
+        let mut first_count = None;
+        for (key, value) in entries {
+            if let Value::Integer(label) = key {
+                let label_value: i128 = label.into();
+                match label_value {
+                    1 => {
+                        let Value::Map(cred_map) = value else {
+                            panic!("credential must be a map");
+                        };
+                        for (cred_key, cred_value) in cred_map {
+                            if cred_key == Value::Text("id".into()) {
+                                if let Value::Bytes(id) = cred_value {
+                                    first_id = Some(id);
+                                }
+                            }
+                        }
+                    }
+                    5 => {
+                        if let Value::Integer(count) = value {
+                            first_count = Some(count);
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+
+        assert_eq!(first_id.expect("first credential id present"), allow_list_order[0]);
+        let first_count_value: i128 = first_count.expect("number of credentials present").into();
+        assert_eq!(first_count_value, 2);
+
+        assert!(app.pending_assertion.is_some(), "state cached for next assertions");
+
+        let response_again = app
+            .handle_get_assertion(&payload)
+            .expect("second getAssertion succeeds");
+        assert_eq!(response_again[0], CTAP2_OK);
+        let Value::Map(entries_again) =
+            from_reader(&response_again[1..]).expect("decode second response")
+        else {
+            panic!("second response must be a map");
+        };
+
+        let mut second_first_id = None;
+        for (key, value) in entries_again {
+            if let Value::Integer(label) = key {
+                if i128::from(label.clone()) == 1 {
+                    let Value::Map(cred_map) = value else {
+                        panic!("credential must be a map");
+                    };
+                    for (cred_key, cred_value) in cred_map {
+                        if cred_key == Value::Text("id".into()) {
+                            if let Value::Bytes(id) = cred_value {
+                                second_first_id = Some(id);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        assert_eq!(
+            second_first_id.expect("credential id present on second call"),
+            allow_list_order[0]
+        );
+
+        let next_response = app
+            .handle_get_next_assertion()
+            .expect("getNextAssertion returns remaining credential");
+        assert_eq!(next_response[0], CTAP2_OK);
+        let Value::Map(next_entries) =
+            from_reader(&next_response[1..]).expect("decode final allowList response")
+        else {
+            panic!("next response must be a map");
+        };
+        let mut remaining_id = None;
+        for (key, value) in next_entries {
+            if let Value::Integer(label) = key {
+                if i128::from(label.clone()) == 1 {
+                    let Value::Map(cred_map) = value else {
+                        panic!("credential must be a map");
+                    };
+                    for (cred_key, cred_value) in cred_map {
+                        if cred_key == Value::Text("id".into()) {
+                            if let Value::Bytes(id) = cred_value {
+                                remaining_id = Some(id);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        assert_eq!(remaining_id.expect("remaining id present"), allow_list_order[1]);
+        assert!(app.pending_assertion.is_none(), "state cleared after final allowList credential");
+
+        let err = app.handle_get_next_assertion();
+        assert_eq!(err, Err(CTAP2_ERR_NOT_ALLOWED));
+    }
+
     fn request_classic_key_agreement(app: &mut CtapApp<TestClient>) -> Vec<(Value, Value)> {
         let request = canonical_map(vec![
             (
@@ -1016,6 +1391,7 @@ pub struct CtapApp<C> {
     pin_state: PinState,
     pin_protocol_session: Option<PinProtocolSession>,
     platform_declined_pqc: bool,
+    pending_assertion: Option<PendingAssertion>,
     #[cfg(test)]
     stored_credentials: Vec<StoredCredential>,
 }
@@ -1028,6 +1404,7 @@ impl<C> CtapApp<C> {
             pin_state: PinState::new(),
             pin_protocol_session: None,
             platform_declined_pqc: false,
+            pending_assertion: None,
             #[cfg(test)]
             stored_credentials: Vec::new(),
         }
@@ -1444,6 +1821,51 @@ where
         auth_data
     }
 
+    fn assertion_response_entries(
+        &self,
+        credential: &mut StoredCredential,
+        rp_id: &str,
+        client_hash: &[u8],
+        uv_verified: bool,
+    ) -> Result<Vec<(Value, Value)>, u8> {
+        let alg =
+            CoseAlg::try_from(credential.alg).map_err(|_| CTAP2_ERR_UNSUPPORTED_ALGORITHM)?;
+        let secret_key_bytes = credential.secret_key.clone();
+        credential.sign_count = credential.sign_count.saturating_add(1);
+        let sign_count = credential.sign_count;
+
+        let signing_key = SecretKey(secret_key_bytes);
+        let auth_data = self.assertion_auth_data(rp_id, sign_count, uv_verified);
+        let signature = sign_challenge(alg, &signing_key, &auth_data, client_hash);
+
+        let credential_map = canonical_map(vec![
+            (Value::Text("type".into()), Value::Text("public-key".into())),
+            (
+                Value::Text("id".into()),
+                Value::Bytes(credential.credential_id.clone()),
+            ),
+        ]);
+
+        let mut user_entries = vec![(
+            Value::Text("id".into()),
+            Value::Bytes(credential.user_id.clone()),
+        )];
+        if let Some(name) = &credential.user_name {
+            user_entries.push((Value::Text("name".into()), Value::Text(name.clone())));
+        }
+        if let Some(display) = &credential.user_display_name {
+            user_entries.push((Value::Text("displayName".into()), Value::Text(display.clone())));
+        }
+        let user_map = canonical_map(user_entries);
+
+        Ok(vec![
+            (Value::Integer(Integer::from(1)), credential_map),
+            (Value::Integer(Integer::from(2)), Value::Bytes(auth_data)),
+            (Value::Integer(Integer::from(3)), Value::Bytes(signature)),
+            (Value::Integer(Integer::from(4)), user_map),
+        ])
+    }
+
     fn handle_get_info(&self) -> Result<Vec<u8>, u8> {
         let mut map = Vec::new();
 
@@ -1712,6 +2134,7 @@ where
     }
 
     fn handle_get_assertion(&mut self, payload: &[u8]) -> Result<Vec<u8>, u8> {
+        self.pending_assertion = None;
         let request: Value = from_reader(payload).map_err(|_| CTAP2_ERR_INVALID_CBOR)?;
         let map = match request {
             Value::Map(map) => map,
@@ -1776,8 +2199,8 @@ where
 
         let mut credentials = self.load_credentials()?;
 
-        let chosen_index = if let Some(list) = allow_list {
-            let mut index = None;
+        let matching_indices = if let Some(list) = allow_list {
+            let mut indices = Vec::new();
             for descriptor in list {
                 let Value::Map(desc_map) = descriptor else {
                     continue;
@@ -1790,72 +2213,85 @@ where
                     .iter()
                     .position(|cred| cred.credential_id == *id && cred.rp_id == rp_id)
                 {
-                    index = Some(pos);
-                    break;
+                    if !indices.contains(&pos) {
+                        indices.push(pos);
+                    }
                 }
             }
-            index.ok_or(CTAP2_ERR_NO_CREDENTIALS)?
+            indices
         } else {
             credentials
                 .iter()
-                .position(|cred| cred.rp_id == rp_id)
-                .ok_or(CTAP2_ERR_NO_CREDENTIALS)?
+                .enumerate()
+                .filter_map(|(idx, cred)| (cred.rp_id == rp_id).then_some(idx))
+                .collect()
         };
 
-        let (
-            credential_id,
-            user_id,
-            user_name,
-            user_display_name,
-            secret_key_bytes,
-            sign_count,
-            alg,
-        ) = {
-            let credential = &mut credentials[chosen_index];
-            let alg =
-                CoseAlg::try_from(credential.alg).map_err(|_| CTAP2_ERR_UNSUPPORTED_ALGORITHM)?;
-            let secret_key_bytes = credential.secret_key.clone();
-            credential.sign_count = credential.sign_count.saturating_add(1);
-            let sign_count = credential.sign_count;
-            (
-                credential.credential_id.clone(),
-                credential.user_id.clone(),
-                credential.user_name.clone(),
-                credential.user_display_name.clone(),
-                secret_key_bytes,
-                sign_count,
-                alg,
-            )
-        };
+        if matching_indices.is_empty() {
+            return Err(CTAP2_ERR_NO_CREDENTIALS);
+        }
 
-        let signing_key = SecretKey(secret_key_bytes.clone());
-        let auth_data = self.assertion_auth_data(&rp_id, sign_count, uv_verified);
-        let signature = sign_challenge(alg, &signing_key, &auth_data, &client_hash);
+        let mut response = self.assertion_response_entries(
+            &mut credentials[matching_indices[0]],
+            &rp_id,
+            &client_hash,
+            uv_verified,
+        )?;
+
+        if matching_indices.len() > 1 {
+            response.push((
+                Value::Integer(Integer::from(5)),
+                Value::Integer(Integer::from(matching_indices.len() as u64)),
+            ));
+        }
+
         self.save_credentials(&credentials)?;
 
-        let credential_map = canonical_map(vec![
-            (Value::Text("type".into()), Value::Text("public-key".into())),
-            (
-                Value::Text("id".into()),
-                Value::Bytes(credential_id.clone()),
-            ),
-        ]);
-
-        let mut user_entries = vec![(Value::Text("id".into()), Value::Bytes(user_id))];
-        if let Some(name) = user_name {
-            user_entries.push((Value::Text("name".into()), Value::Text(name)));
+        if matching_indices.len() > 1 {
+            self.pending_assertion = Some(PendingAssertion {
+                credentials,
+                matching_indices,
+                next_index: 1,
+                client_data_hash: client_hash,
+                rp_id,
+                uv_verified,
+            });
         }
-        if let Some(display) = user_display_name {
-            user_entries.push((Value::Text("displayName".into()), Value::Text(display)));
-        }
-        let user_map = canonical_map(user_entries);
 
-        let mut response = vec![
-            (Value::Integer(Integer::from(1)), credential_map),
-            (Value::Integer(Integer::from(2)), Value::Bytes(auth_data)),
-            (Value::Integer(Integer::from(3)), Value::Bytes(signature)),
-            (Value::Integer(Integer::from(4)), user_map),
-        ];
+        canonical_sort(&mut response);
+        let mut encoded = Vec::new();
+        into_writer(&Value::Map(response), &mut encoded).map_err(|_| CTAP2_ERR_PROCESSING)?;
+        let mut out = Vec::with_capacity(1 + encoded.len());
+        out.push(CTAP2_OK);
+        out.extend_from_slice(&encoded);
+        Ok(out)
+    }
+
+    fn handle_get_next_assertion(&mut self) -> Result<Vec<u8>, u8> {
+        let mut pending = self
+            .pending_assertion
+            .take()
+            .ok_or(CTAP2_ERR_NOT_ALLOWED)?;
+
+        if pending.next_index >= pending.matching_indices.len() {
+            return Err(CTAP2_ERR_NOT_ALLOWED);
+        }
+
+        let index = pending.matching_indices[pending.next_index];
+        pending.next_index += 1;
+
+        let mut response = self.assertion_response_entries(
+            &mut pending.credentials[index],
+            &pending.rp_id,
+            &pending.client_data_hash,
+            pending.uv_verified,
+        )?;
+
+        self.save_credentials(&pending.credentials)?;
+
+        if pending.next_index < pending.matching_indices.len() {
+            self.pending_assertion = Some(pending);
+        }
 
         canonical_sort(&mut response);
         let mut encoded = Vec::new();
@@ -1892,6 +2328,7 @@ where
                     CTAP_CMD_GET_INFO => self.handle_get_info(),
                     CTAP_CMD_MAKE_CREDENTIAL => self.handle_make_credential(payload),
                     CTAP_CMD_GET_ASSERTION => self.handle_get_assertion(payload),
+                    CTAP_CMD_GET_NEXT_ASSERTION => self.handle_get_next_assertion(),
                     CTAP_CMD_CLIENT_PIN => self.handle_client_pin(payload),
                     _ => Err(CTAP2_ERR_INVALID_CBOR),
                 };
