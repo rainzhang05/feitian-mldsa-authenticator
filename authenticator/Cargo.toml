@@ -13,6 +13,8 @@ ciborium = { version = "0.2", default-features = false }
 heapless = "0.7"
 littlefs2 = "0.4"
 aes-gcm = "0.10"
+aes = "0.8"
+cbc = { version = "0.1", features = ["alloc"] }
 hkdf = "0.12"
 sha2 = "0.10"
 hmac = "0.12"
