@@ -1879,8 +1879,7 @@ fn classic_pin_auth(protocol: ClassicPinProtocol, keys: &PinUvSessionKeys, data:
     mac.update(data);
     let full = mac.finalize().into_bytes();
     match protocol {
-        ClassicPinProtocol::V1 => full[..16].to_vec(),
-        ClassicPinProtocol::V2 => full.to_vec(),
+        ClassicPinProtocol::V1 | ClassicPinProtocol::V2 => full[..16].to_vec(),
     }
 }
 

@@ -224,7 +224,7 @@ impl PinState {
     }
 
     fn needs_power_cycle(&self) -> bool {
-        self.consecutive_failures >= MAX_PIN_FAILURES_BEFORE_BLOCK
+        self.pin_retries > 0 && self.consecutive_failures >= MAX_PIN_FAILURES_BEFORE_BLOCK
     }
 
     fn verify_pin_hash(&mut self, candidate: &[u8; 16]) -> Result<(), u8> {
@@ -608,7 +608,8 @@ where
         mac.update(data);
         let result = mac.finalize().into_bytes();
         match protocol {
-            PinProtocol::Classic(ClassicPinProtocol::V1) => {
+            PinProtocol::Classic(ClassicPinProtocol::V1)
+            | PinProtocol::Classic(ClassicPinProtocol::V2) => {
                 if provided.len() != 16 {
                     return Err(CTAP2_ERR_PIN_AUTH_INVALID);
                 }
@@ -618,11 +619,11 @@ where
                     Err(CTAP2_ERR_PIN_AUTH_INVALID)
                 }
             }
-            PinProtocol::Classic(ClassicPinProtocol::V2) | PinProtocol::Pqc => {
+            PinProtocol::Pqc => {
                 if provided.len() != 32 {
                     return Err(CTAP2_ERR_PIN_AUTH_INVALID);
                 }
-                if result.as_slice() == provided {
+                if result[..] == provided[..] {
                     Ok(())
                 } else {
                     Err(CTAP2_ERR_PIN_AUTH_INVALID)
