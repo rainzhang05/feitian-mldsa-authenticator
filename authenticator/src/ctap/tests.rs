@@ -1857,6 +1857,42 @@ fn client_pin_get_retries_includes_power_cycle_state_when_blocked() {
     assert!(power_cycle);
 }
 
+#[test]
+fn pin_auth_blocked_persists_until_power_cycle() {
+    let mut pin_state = PinState::new();
+    let pin_hash = [0x33; 16];
+    pin_state.set_pin(pin_hash);
+    let wrong = [0x44; 16];
+
+    for attempt in 0..MAX_PIN_FAILURES_BEFORE_BLOCK {
+        let result = pin_state.verify_pin_hash(&wrong);
+        if attempt + 1 < MAX_PIN_FAILURES_BEFORE_BLOCK {
+            assert_eq!(result, Err(CTAP2_ERR_PIN_INVALID));
+        } else {
+            assert_eq!(result, Err(CTAP2_ERR_PIN_AUTH_BLOCKED));
+        }
+    }
+
+    let retries_after_block = pin_state.retries();
+    assert!(pin_state.needs_power_cycle());
+
+    assert_eq!(
+        pin_state.verify_pin_hash(&pin_hash),
+        Err(CTAP2_ERR_PIN_AUTH_BLOCKED)
+    );
+    assert_eq!(pin_state.retries(), retries_after_block);
+    assert_eq!(
+        pin_state.verify_pin_hash(&wrong),
+        Err(CTAP2_ERR_PIN_AUTH_BLOCKED)
+    );
+    assert_eq!(pin_state.retries(), retries_after_block);
+
+    let mut restored_state = PinState::new();
+    restored_state.set_pin(pin_hash);
+    assert_eq!(restored_state.verify_pin_hash(&pin_hash), Ok(()));
+    assert!(!restored_state.needs_power_cycle());
+}
+
 fn request_classic_key_agreement(
     app: &mut CtapApp<TestClient>,
     protocol: ClassicPinProtocol,
@@ -2263,8 +2299,8 @@ fn client_pin_get_token_legacy_succeeds_without_pin_uv_auth_param() {
         .handle_client_pin(&payload)
         .expect("getPinToken without pinUvAuthParam succeeds");
     assert_eq!(response[0], CTAP2_OK);
-    let Value::Map(map) = from_reader(&response[1..])
-        .expect("decode getPinToken response without pinUvAuthParam")
+    let Value::Map(map) =
+        from_reader(&response[1..]).expect("decode getPinToken response without pinUvAuthParam")
     else {
         panic!("response must be a map");
     };
@@ -2276,12 +2312,9 @@ fn client_pin_get_token_legacy_succeeds_without_pin_uv_auth_param() {
             _ => None,
         })
         .expect("encrypted token present");
-    let decrypted_token = crate::decrypt_classic_pin_block(
-        ClassicPinProtocol::V2,
-        &keys,
-        &encrypted_token,
-    )
-    .expect("token decrypts");
+    let decrypted_token =
+        crate::decrypt_classic_pin_block(ClassicPinProtocol::V2, &keys, &encrypted_token)
+            .expect("token decrypts");
     assert_eq!(decrypted_token.len(), 32);
     let mut expected_token = [0u8; 32];
     expected_token.copy_from_slice(&decrypted_token);
@@ -2341,8 +2374,8 @@ fn client_pin_token_with_permissions_accepts_missing_pin_uv_auth_param() {
         .handle_client_pin(&payload)
         .expect("getPinUvAuthTokenWithPermissions without pinUvAuthParam succeeds");
     assert_eq!(response[0], CTAP2_OK);
-    let Value::Map(map) = from_reader(&response[1..])
-        .expect("decode getPinUvAuthTokenWithPermissions response")
+    let Value::Map(map) =
+        from_reader(&response[1..]).expect("decode getPinUvAuthTokenWithPermissions response")
     else {
         panic!("response must be a map");
     };
@@ -2354,12 +2387,9 @@ fn client_pin_token_with_permissions_accepts_missing_pin_uv_auth_param() {
             _ => None,
         })
         .expect("encrypted token present");
-    let decrypted_token = crate::decrypt_classic_pin_block(
-        ClassicPinProtocol::V2,
-        &keys,
-        &encrypted_token,
-    )
-    .expect("token decrypts");
+    let decrypted_token =
+        crate::decrypt_classic_pin_block(ClassicPinProtocol::V2, &keys, &encrypted_token)
+            .expect("token decrypts");
     assert_eq!(decrypted_token.len(), 32);
     let mut expected_token = [0u8; 32];
     expected_token.copy_from_slice(&decrypted_token);

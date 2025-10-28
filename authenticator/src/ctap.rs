@@ -187,6 +187,7 @@ struct PinState {
     pin_hash: Option<[u8; 16]>,
     pin_retries: u8,
     consecutive_failures: u8,
+    pin_auth_blocked: bool,
     pin_uv_auth_token: Option<[u8; 32]>,
     pin_uv_auth_permissions: u8,
     pin_uv_auth_rp_id: Option<String>,
@@ -201,6 +202,7 @@ impl PinState {
             pin_hash: None,
             pin_retries: MAX_PIN_RETRIES,
             consecutive_failures: 0,
+            pin_auth_blocked: false,
             pin_uv_auth_token: None,
             pin_uv_auth_permissions: 0,
             pin_uv_auth_rp_id: None,
@@ -224,13 +226,16 @@ impl PinState {
     }
 
     fn needs_power_cycle(&self) -> bool {
-        self.pin_retries > 0 && self.consecutive_failures >= MAX_PIN_FAILURES_BEFORE_BLOCK
+        self.pin_auth_blocked
     }
 
     fn verify_pin_hash(&mut self, candidate: &[u8; 16]) -> Result<(), u8> {
         let Some(stored) = self.pin_hash else {
             return Err(CTAP2_ERR_PIN_NOT_SET);
         };
+        if self.pin_auth_blocked {
+            return Err(CTAP2_ERR_PIN_AUTH_BLOCKED);
+        }
         if stored == *candidate {
             self.pin_retries = MAX_PIN_RETRIES;
             self.consecutive_failures = 0;
@@ -247,6 +252,7 @@ impl PinState {
                 .saturating_add(1)
                 .min(MAX_PIN_FAILURES_BEFORE_BLOCK);
             if self.consecutive_failures >= MAX_PIN_FAILURES_BEFORE_BLOCK {
+                self.pin_auth_blocked = true;
                 Err(CTAP2_ERR_PIN_AUTH_BLOCKED)
             } else {
                 Err(CTAP2_ERR_PIN_INVALID)
