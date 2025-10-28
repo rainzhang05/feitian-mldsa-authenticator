@@ -150,8 +150,7 @@ fn classic_key_agreement_value_is_canonical() {
     let mut actual_bytes = Vec::new();
     into_writer(&value, &mut actual_bytes).expect("encode classic key agreement map");
     let mut expected_bytes = Vec::new();
-    into_writer(&expected, &mut expected_bytes)
-        .expect("encode expected classic key agreement map");
+    into_writer(&expected, &mut expected_bytes).expect("encode expected classic key agreement map");
     assert_eq!(actual_bytes, expected_bytes);
 }
 
@@ -305,8 +304,7 @@ fn get_assertion_response_encoding_is_canonical() {
 
     let sign_count = app.stored_credentials[0].sign_count;
     assert_eq!(sign_count, 1);
-    let Value::Map(entries) =
-        from_reader(&response[1..]).expect("decode getAssertion response")
+    let Value::Map(entries) = from_reader(&response[1..]).expect("decode getAssertion response")
     else {
         panic!("response must be a map");
     };
@@ -501,8 +499,7 @@ fn get_assertion_without_pin_uv_uses_presence_only() {
         .expect("getAssertion succeeds");
     assert_eq!(response[0], CTAP2_OK);
 
-    let Value::Map(entries) =
-        from_reader(&response[1..]).expect("decode getAssertion response")
+    let Value::Map(entries) = from_reader(&response[1..]).expect("decode getAssertion response")
     else {
         panic!("response must be a map");
     };
@@ -679,8 +676,7 @@ fn make_credential_includes_extensions() {
     offset += credential.public_key.len();
 
     let extension_bytes = &auth_data[offset..];
-    let Value::Map(extension_map) = from_reader(extension_bytes).expect("decode extensions")
-    else {
+    let Value::Map(extension_map) = from_reader(extension_bytes).expect("decode extensions") else {
         panic!("extensions must be a map");
     };
     let hmac_value = extension_map
@@ -739,8 +735,7 @@ fn get_assertion_produces_hmac_secret_output() {
             Value::Integer(Integer::from(CoseAlg::MLDSA44 as i32)),
         ),
     ])]);
-    let extensions =
-        canonical_map(vec![(Value::Text("hmac-secret".into()), Value::Bool(true))]);
+    let extensions = canonical_map(vec![(Value::Text("hmac-secret".into()), Value::Bool(true))]);
 
     let make_credential = canonical_map(vec![
         (
@@ -774,8 +769,7 @@ fn get_assertion_produces_hmac_secret_output() {
     let salt = vec![0x99; 32];
     let salt_enc = encrypt_shared_secret(&session_keys.encryption_key, &salt)
         .expect("salt encryption succeeds");
-    let mut salt_mac =
-        HmacSha256::new_from_slice(&session_keys.auth_key).expect("valid MAC key");
+    let mut salt_mac = HmacSha256::new_from_slice(&session_keys.auth_key).expect("valid MAC key");
     salt_mac.update(&salt_enc);
     let salt_auth: Vec<u8> = salt_mac.finalize().into_bytes()[..16].to_vec();
 
@@ -845,8 +839,7 @@ fn get_assertion_produces_hmac_secret_output() {
     assert_eq!(auth_data[32] & 0x80, 0x80);
 
     let extension_bytes = &auth_data[32 + 1 + 4..];
-    let Value::Map(extension_map) = from_reader(extension_bytes).expect("decode extensions")
-    else {
+    let Value::Map(extension_map) = from_reader(extension_bytes).expect("decode extensions") else {
         panic!("extensions must be a map");
     };
     let encrypted_output = extension_map
@@ -1216,10 +1209,9 @@ fn credential_management_commands() {
     let Value::Map(map) = from_reader(&response[1..]).expect("decode RP begin") else {
         panic!("response must be map");
     };
-    assert!(map
-        .iter()
-        .any(|(k, v)| *k == Value::Integer(Integer::from(4))
-            && *v == Value::Bytes(rp_hash.clone())));
+    assert!(map.iter().any(
+        |(k, v)| *k == Value::Integer(Integer::from(4)) && *v == Value::Bytes(rp_hash.clone())
+    ));
 
     let rp_next = canonical_map(vec![
         (
@@ -1549,8 +1541,7 @@ fn client_pin_token_with_permissions_sets_metadata() {
     app.pin_state.set_pin(pin_hash);
 
     let auth_entries = request_classic_key_agreement(&mut app);
-    let platform_secret =
-        P256SecretKey::from_slice(&[0x33; 32]).expect("valid platform secret");
+    let platform_secret = P256SecretKey::from_slice(&[0x33; 32]).expect("valid platform secret");
     let (keys, transcript_hash, platform_entries) =
         derive_classic_session(&auth_entries, &platform_secret);
     let nonce = [0u8; 12];
@@ -1615,8 +1606,7 @@ fn client_pin_token_with_permissions_requires_rp_id() {
     app.pin_state.set_pin(pin_hash);
 
     let auth_entries = request_classic_key_agreement(&mut app);
-    let platform_secret =
-        P256SecretKey::from_slice(&[0x44; 32]).expect("valid platform secret");
+    let platform_secret = P256SecretKey::from_slice(&[0x44; 32]).expect("valid platform secret");
     let (keys, transcript_hash, platform_entries) =
         derive_classic_session(&auth_entries, &platform_secret);
     let nonce = [0u8; 12];
@@ -1714,8 +1704,7 @@ fn classic_pin_uv_protocol_flow() {
     let pin_hash = &pin_digest[..16];
     let pin_hash_enc =
         crate::encrypt_pin_block(&token_keys, &nonce, pin_hash, &token_transcript_hash);
-    let mut token_mac =
-        HmacSha256::new_from_slice(&token_keys.auth_key).expect("valid MAC key");
+    let mut token_mac = HmacSha256::new_from_slice(&token_keys.auth_key).expect("valid MAC key");
     token_mac.update(&pin_hash_enc);
     let pin_hash_auth = token_mac.finalize().into_bytes();
     let get_token_request = canonical_map(vec![
@@ -1746,8 +1735,7 @@ fn classic_pin_uv_protocol_flow() {
         .handle_client_pin(&payload)
         .expect("getPinToken succeeds");
     assert_eq!(response[0], CTAP2_OK);
-    let Value::Map(map) = from_reader(&response[1..]).expect("decode getPinToken response")
-    else {
+    let Value::Map(map) = from_reader(&response[1..]).expect("decode getPinToken response") else {
         panic!("response must be a map");
     };
     let encrypted_token = map
@@ -1806,8 +1794,8 @@ fn classic_pin_uv_protocol_flow() {
             Value::Bytes(client_data_hash_mc.clone()),
         ),
         (Value::Integer(Integer::from(2)), rp),
-        (Value::Integer(Integer::from(3)), user),
-        (Value::Integer(Integer::from(4)), pub_key_params),
+        (Value::Integer(Integer::from(3)), user.clone()),
+        (Value::Integer(Integer::from(4)), pub_key_params.clone()),
         (
             Value::Integer(Integer::from(8)),
             Value::Bytes(pin_uv_auth_param_mc.clone()),
@@ -1839,7 +1827,42 @@ fn classic_pin_uv_protocol_flow() {
         .handle_make_credential(&payload)
         .expect("makeCredential succeeds");
     assert_eq!(response[0], CTAP2_OK);
-    assert_eq!(app.pin_state.permissions_rp_id(), Some("example.com"));
+    assert_eq!(app.pin_state.permissions_rp_id(), None);
+
+    // Make another credential for a different RP to confirm the legacy token
+    // remains reusable across relying parties.
+    let other_rp = canonical_map(vec![(
+        Value::Text("id".into()),
+        Value::Text("second.example.com".into()),
+    )]);
+    let client_data_hash_mc_other = vec![0xAC; 32];
+    let mut mac = HmacSha256::new_from_slice(&pin_uv_auth_token).expect("valid token MAC");
+    mac.update(&client_data_hash_mc_other);
+    let pin_uv_auth_param_mc_other: Vec<u8> = mac.finalize().into_bytes()[..16].to_vec();
+    let make_credential_other = canonical_map(vec![
+        (
+            Value::Integer(Integer::from(1)),
+            Value::Bytes(client_data_hash_mc_other.clone()),
+        ),
+        (Value::Integer(Integer::from(2)), other_rp),
+        (Value::Integer(Integer::from(3)), user.clone()),
+        (Value::Integer(Integer::from(4)), pub_key_params.clone()),
+        (
+            Value::Integer(Integer::from(8)),
+            Value::Bytes(pin_uv_auth_param_mc_other.clone()),
+        ),
+        (
+            Value::Integer(Integer::from(9)),
+            Value::Integer(Integer::from(PIN_UV_AUTH_PROTOCOL_CLASSIC)),
+        ),
+    ]);
+    let mut payload = Vec::new();
+    into_writer(&make_credential_other, &mut payload).expect("serialize makeCredential request");
+    let response = app
+        .handle_make_credential(&payload)
+        .expect("second makeCredential succeeds");
+    assert_eq!(response[0], CTAP2_OK);
+    assert_eq!(app.pin_state.permissions_rp_id(), None);
 
     // Use the stored token to get an assertion via the classic protocol path.
     let client_data_hash_ga = vec![0xBB; 32];
@@ -1871,5 +1894,5 @@ fn classic_pin_uv_protocol_flow() {
         .expect("getAssertion succeeds");
     assert_eq!(response[0], CTAP2_OK);
     assert!(app.pin_state.pin_uv_auth_token().is_some());
-    assert_eq!(app.pin_state.permissions_rp_id(), Some("example.com"));
+    assert_eq!(app.pin_state.permissions_rp_id(), None);
 }

@@ -174,6 +174,7 @@ struct PinState {
     pin_uv_auth_token: Option<[u8; 32]>,
     pin_uv_auth_permissions: u8,
     pin_uv_auth_rp_id: Option<String>,
+    pin_uv_auth_rp_provided: bool,
 }
 
 impl PinState {
@@ -187,6 +188,7 @@ impl PinState {
             pin_uv_auth_token: None,
             pin_uv_auth_permissions: 0,
             pin_uv_auth_rp_id: None,
+            pin_uv_auth_rp_provided: false,
         }
     }
 
@@ -237,6 +239,7 @@ impl PinState {
             token.zeroize();
         }
         self.pin_uv_auth_permissions = 0;
+        self.pin_uv_auth_rp_provided = false;
         if let Some(mut rp_id) = self.pin_uv_auth_rp_id.take() {
             rp_id.zeroize();
         }
@@ -247,6 +250,7 @@ impl PinState {
         self.pin_uv_auth_token = Some(token);
         self.pin_uv_auth_permissions = permissions;
         self.pin_uv_auth_rp_id = rp_id;
+        self.pin_uv_auth_rp_provided = self.pin_uv_auth_rp_id.is_some();
     }
 
     fn pin_uv_auth_token(&self) -> Option<[u8; 32]> {
@@ -265,7 +269,14 @@ impl PinState {
         self.pin_uv_auth_rp_id.as_deref()
     }
 
+    fn should_bind_pin_token_to_rp(&self) -> bool {
+        self.pin_uv_auth_rp_provided
+    }
+
     fn set_permissions_rp_id(&mut self, rp_id: &str) {
+        if !self.should_bind_pin_token_to_rp() {
+            return;
+        }
         if let Some(mut existing) = self.pin_uv_auth_rp_id.take() {
             existing.zeroize();
         }
@@ -522,7 +533,6 @@ impl PinProtocolSession {
 
 #[cfg(test)]
 mod tests;
-
 
 pub struct CtapApp<C> {
     client: C,
@@ -926,6 +936,9 @@ where
         if !self.pin_state.has_permission(permission) {
             return Err(CTAP2_ERR_PIN_AUTH_INVALID);
         }
+        if !self.pin_state.should_bind_pin_token_to_rp() {
+            return Ok(());
+        }
         match self.pin_state.permissions_rp_id() {
             Some(existing) => {
                 if existing != rp_id {
@@ -981,9 +994,7 @@ where
                     return Err(CTAP2_ERR_MISSING_PARAMETER);
                 };
                 let credentials = self.load_credentials()?;
-                let Some(credential) = credentials
-                    .iter()
-                    .find(|cred| cred.credential_id == *id)
+                let Some(credential) = credentials.iter().find(|cred| cred.credential_id == *id)
                 else {
                     return Err(CTAP2_ERR_NO_CREDENTIALS);
                 };
