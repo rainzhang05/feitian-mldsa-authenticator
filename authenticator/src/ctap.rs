@@ -2059,6 +2059,7 @@ where
             .skip(1)
             .map(|idx| credentials[*idx].credential_id.clone())
             .collect();
+        let remaining_count = remaining_credentials.len();
 
         let (
             credential_id,
@@ -2126,7 +2127,7 @@ where
         let signature = sign_challenge(alg, &signing_key, &auth_data, &client_hash);
         self.save_credentials(&credentials)?;
 
-        if !remaining_credentials.is_empty() {
+        if remaining_count != 0 {
             self.pending_assertion = Some(PendingAssertion {
                 rp_id: rp_id.clone(),
                 client_hash: client_hash.clone(),
@@ -2160,6 +2161,14 @@ where
             (Value::Integer(Integer::from(3)), Value::Bytes(signature)),
             (Value::Integer(Integer::from(4)), user_map),
         ];
+
+        if remaining_count != 0 {
+            let total_count = 1 + remaining_count;
+            response.push((
+                Value::Integer(Integer::from(5)),
+                Value::Integer(Integer::from(total_count as u64)),
+            ));
+        }
 
         canonical_sort(&mut response);
         let mut encoded = Vec::new();

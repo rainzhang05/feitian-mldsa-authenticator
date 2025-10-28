@@ -415,6 +415,27 @@ fn get_next_assertion_preserves_new_credentials() {
     assert!(app.pending_assertion.is_some());
     assert_eq!(app.stored_credentials[0].sign_count, 1);
 
+    let Value::Map(entries) = from_reader(&response[1..]).expect("decode getAssertion response")
+    else {
+        panic!("response must be a map");
+    };
+    let mut total_credentials_value = None;
+    for (key, value) in entries {
+        if let Value::Integer(label) = key {
+            if label == Integer::from(5) {
+                total_credentials_value = Some(value);
+            }
+        }
+    }
+    let total_credentials = match total_credentials_value.expect("total credential count present") {
+        Value::Integer(int) => {
+            let count: i128 = int.into();
+            count
+        }
+        _ => panic!("total credential count must be an integer"),
+    };
+    assert_eq!(total_credentials, 2);
+
     let (pk3, sk3) = create_credential(CoseAlg::MLDSA44);
     app.stored_credentials.push(StoredCredential {
         rp_id: "new.example".into(),
@@ -447,6 +468,21 @@ fn get_next_assertion_preserves_new_credentials() {
         .find(|cred| cred.credential_id == vec![0xA2])
         .expect("second credential present");
     assert_eq!(second.sign_count, 1);
+
+    let Value::Map(entries) =
+        from_reader(&next_response[1..]).expect("decode getNextAssertion response")
+    else {
+        panic!("next response must be a map");
+    };
+    for (key, _) in entries {
+        if let Value::Integer(label) = key {
+            assert_ne!(
+                label,
+                Integer::from(5),
+                "getNextAssertion must omit total count"
+            );
+        }
+    }
 }
 
 #[test]
