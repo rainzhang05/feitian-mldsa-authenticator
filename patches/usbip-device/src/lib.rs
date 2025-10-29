@@ -146,6 +146,7 @@ pub(crate) struct UsbIpBusInner {
     pub handler: SocketHandler,
     pub endpoint: [Endpoint; NUM_ENDPOINTS],
     pub device_address: u8,
+    pub device_speed: u32,
     pub reset: bool,
     pub suspended: bool,
 }
@@ -157,6 +158,7 @@ impl UsbIpBusInner {
             handler: SocketHandler::new(),
             endpoint: <[Endpoint; NUM_ENDPOINTS]>::default(),
             device_address: 0,
+            device_speed: 3,
             reset: true,
             suspended: false,
         }
@@ -239,8 +241,14 @@ impl UsbIpBus {
         Self(Arc::new(Mutex::new(UsbIpBusInner::new())))
     }
 
-    fn lock(&self) -> MutexGuard<UsbIpBusInner> {
+    fn lock(&self) -> MutexGuard<'_, UsbIpBusInner> {
         self.0.lock().unwrap()
+    }
+
+    /// Sets the USB device speed reported to the host.
+    pub fn set_device_speed(&self, speed: u32) {
+        let mut inner = self.lock();
+        inner.device_speed = speed;
     }
 }
 

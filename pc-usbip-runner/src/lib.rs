@@ -188,7 +188,9 @@ where
 
     pub fn exec(self, platform: Platform, data: A::Data) {
         // To change IP or port see usbip-device-0.1.4/src/handler.rs:26
-        let bus_allocator = UsbBusAllocator::new(UsbIpBus::new());
+        let usbip_bus = UsbIpBus::new();
+        usbip_bus.set_device_speed(2);
+        let bus_allocator = UsbBusAllocator::new(usbip_bus);
 
         #[cfg(feature = "ctaphid")]
         let ctap_channel = ctaphid_dispatch::Channel::new();
