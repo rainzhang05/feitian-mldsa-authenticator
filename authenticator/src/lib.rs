@@ -7,6 +7,11 @@ use cbc::{Decryptor, Encryptor};
 use ciborium::ser::into_writer;
 use ciborium::value::{Integer, Value};
 use hkdf::Hkdf;
+use p256::ecdsa::{
+    signature::Signer, Signature as P256EcdsaSignature, SigningKey as P256SigningKey,
+};
+use p256::{EncodedPoint, SecretKey as P256SecretKey};
+use rand_core::OsRng;
 use sha2::{Digest, Sha256};
 use trussed_mldsa::{keypair, sign, ParamSet, PublicKey, SecretKey};
 use trussed_mlkem::ParamSet as KemParamSet;
@@ -228,6 +233,7 @@ pub fn decrypt_classic_pin_block(
 /// * -50 -> ML-DSA-87
 #[derive(Debug, Copy, Clone, Eq, PartialEq)]
 pub enum CoseAlg {
+    ES256 = -7,
     MLDSA44 = -48,
     MLDSA65 = -49,
     MLDSA87 = -50,
@@ -237,6 +243,7 @@ impl TryFrom<i32> for CoseAlg {
     type Error = ();
     fn try_from(value: i32) -> Result<Self, Self::Error> {
         match value {
+            -7 => Ok(CoseAlg::ES256),
             -48 => Ok(CoseAlg::MLDSA44),
             -49 => Ok(CoseAlg::MLDSA65),
             -50 => Ok(CoseAlg::MLDSA87),
@@ -246,11 +253,12 @@ impl TryFrom<i32> for CoseAlg {
 }
 
 /// Map a COSE algorithm identifier to the corresponding ML-DSA parameter set.
-pub fn paramset_from_alg(alg: CoseAlg) -> ParamSet {
+pub fn mldsa_paramset_from_alg(alg: CoseAlg) -> Option<ParamSet> {
     match alg {
-        CoseAlg::MLDSA44 => ParamSet::MLDSA44,
-        CoseAlg::MLDSA65 => ParamSet::MLDSA65,
-        CoseAlg::MLDSA87 => ParamSet::MLDSA87,
+        CoseAlg::MLDSA44 => Some(ParamSet::MLDSA44),
+        CoseAlg::MLDSA65 => Some(ParamSet::MLDSA65),
+        CoseAlg::MLDSA87 => Some(ParamSet::MLDSA87),
+        _ => None,
     }
 }
 
@@ -301,30 +309,115 @@ pub fn cose_public_key(ps: ParamSet, pk: &PublicKey) -> Vec<u8> {
     out
 }
 
-/// Generate a new ML-DSA credential.  Returns the COSE_Key and a secret key
-/// wrapper.  In a real authenticator you would store the secret key in
-/// secure persistent storage and return only the credential ID and public
-/// key to the client.
-pub fn create_credential(alg: CoseAlg) -> (Vec<u8>, SecretKey) {
-    let ps = paramset_from_alg(alg);
-    let (pk, sk) = keypair(ps);
-    let cose = cose_public_key(ps, &pk);
-    (cose, sk)
+fn cose_es256_public_key(point: &EncodedPoint) -> Vec<u8> {
+    assert!(
+        !point.is_identity(),
+        "P-256 key must not be point at infinity"
+    );
+    let x = point
+        .x()
+        .expect("P-256 public key must include an X coordinate")
+        .to_vec();
+    let y = point
+        .y()
+        .expect("P-256 public key must include a Y coordinate")
+        .to_vec();
+    let map = Value::Map(vec![
+        (
+            Value::Integer(Integer::from(COSE_KEY_LABEL_KTY)),
+            Value::Integer(Integer::from(2)),
+        ),
+        (
+            Value::Integer(Integer::from(COSE_KEY_LABEL_ALG)),
+            Value::Integer(Integer::from(CoseAlg::ES256 as i32)),
+        ),
+        (
+            Value::Integer(Integer::from(-1)),
+            Value::Integer(Integer::from(1)),
+        ),
+        (Value::Integer(Integer::from(-2)), Value::Bytes(x)),
+        (Value::Integer(Integer::from(-3)), Value::Bytes(y)),
+    ]);
+    let mut out = Vec::new();
+    into_writer(&map, &mut out).expect("CBOR encoding failed");
+    out
+}
+
+/// Credential secret key variants supported by the authenticator.
+#[derive(Debug)]
+pub enum CredentialSecretKey {
+    MlDsa(SecretKey),
+    Es256(P256SigningKey),
+}
+
+impl CredentialSecretKey {
+    /// Serialize the secret key into a byte vector suitable for storage.
+    pub fn to_bytes(&self) -> Vec<u8> {
+        match self {
+            CredentialSecretKey::MlDsa(sk) => sk.0.clone(),
+            CredentialSecretKey::Es256(sk) => sk.to_bytes().to_vec(),
+        }
+    }
+}
+
+/// Reconstruct a credential secret key from stored bytes.
+pub fn credential_secret_from_bytes(alg: CoseAlg, bytes: &[u8]) -> Result<CredentialSecretKey, ()> {
+    match alg {
+        CoseAlg::ES256 => {
+            let secret = P256SecretKey::from_slice(bytes).map_err(|_| ())?;
+            Ok(CredentialSecretKey::Es256(P256SigningKey::from(secret)))
+        }
+        CoseAlg::MLDSA44 | CoseAlg::MLDSA65 | CoseAlg::MLDSA87 => {
+            Ok(CredentialSecretKey::MlDsa(SecretKey(bytes.to_vec())))
+        }
+    }
+}
+
+/// Generate a new credential.  Returns the COSE_Key and a secret key wrapper.
+/// In a real authenticator you would store the secret key in secure
+/// persistent storage and return only the credential ID and public key to the
+/// client.
+pub fn create_credential(alg: CoseAlg) -> (Vec<u8>, CredentialSecretKey) {
+    match alg {
+        CoseAlg::ES256 => {
+            let signing_key = P256SigningKey::random(&mut OsRng);
+            let public_key = signing_key.verifying_key().to_encoded_point(false);
+            let cose = cose_es256_public_key(&public_key);
+            (cose, CredentialSecretKey::Es256(signing_key))
+        }
+        _ => {
+            let ps = mldsa_paramset_from_alg(alg).expect("ML-DSA algorithm expected");
+            let (pk, sk) = keypair(ps);
+            let cose = cose_public_key(ps, &pk);
+            (cose, CredentialSecretKey::MlDsa(sk))
+        }
+    }
 }
 
 /// Produce an ML-DSA signature over `auth_data || client_data_hash` using
 /// the provided secret key.  Returns the raw signature bytes.
 pub fn sign_challenge(
     alg: CoseAlg,
-    sk: &SecretKey,
+    sk: &CredentialSecretKey,
     auth_data: &[u8],
     client_data_hash: &[u8],
 ) -> Vec<u8> {
-    let ps = paramset_from_alg(alg);
     let mut msg = Vec::with_capacity(auth_data.len() + client_data_hash.len());
     msg.extend_from_slice(auth_data);
     msg.extend_from_slice(client_data_hash);
-    sign(ps, sk, &msg)
+    match (alg, sk) {
+        (CoseAlg::ES256, CredentialSecretKey::Es256(sk)) => {
+            let signature: P256EcdsaSignature = sk.sign(&msg);
+            signature.to_der().as_bytes().to_vec()
+        }
+        _ => {
+            let ps = mldsa_paramset_from_alg(alg).expect("ML-DSA algorithm expected");
+            match sk {
+                CredentialSecretKey::MlDsa(sk) => sign(ps, sk, &msg),
+                _ => panic!("secret key type does not match algorithm"),
+            }
+        }
+    }
 }
 
 // Additional structs and functions would be defined here to manage
@@ -390,10 +483,80 @@ mod tests {
             let auth_data = b"auth_data";
             let client_hash = b"client_data_hash";
             let signature = sign_challenge(alg, &secret_key, auth_data, client_hash);
-            let ps = paramset_from_alg(alg);
+            let ps = mldsa_paramset_from_alg(alg).expect("ML-DSA param set");
             let message: Vec<u8> = auth_data.iter().chain(client_hash).cloned().collect();
             let pk = PublicKey(public_key_from_cose(&public_key_cbor));
             assert!(verify(ps, &pk, &message, &signature));
+        }
+    }
+
+    #[test]
+    fn es256_credential_roundtrip() {
+        let (cose_key, secret_key) = create_credential(CoseAlg::ES256);
+        assert_eq!(secret_key.to_bytes().len(), 32);
+
+        let value: ciborium::value::Value =
+            from_reader(cose_key.as_slice()).expect("decode ES256 COSE key");
+        let ciborium::value::Value::Map(entries) = value else {
+            panic!("COSE key must be a map");
+        };
+
+        let mut kty = None;
+        let mut alg = None;
+        let mut crv = None;
+        let mut x_bytes = None;
+        let mut y_bytes = None;
+
+        for (key, val) in entries {
+            if let ciborium::value::Value::Integer(label) = key {
+                let label_value: i128 = label.into();
+                match label_value {
+                    1 => kty = Some(val),
+                    3 => alg = Some(val),
+                    -1 => crv = Some(val),
+                    -2 => {
+                        if let ciborium::value::Value::Bytes(bytes) = val {
+                            x_bytes = Some(bytes);
+                        }
+                    }
+                    -3 => {
+                        if let ciborium::value::Value::Bytes(bytes) = val {
+                            y_bytes = Some(bytes);
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+
+        assert_eq!(
+            kty,
+            Some(ciborium::value::Value::Integer(Integer::from(2))),
+            "kty present"
+        );
+        assert_eq!(
+            alg,
+            Some(ciborium::value::Value::Integer(Integer::from(
+                CoseAlg::ES256 as i32
+            ))),
+            "alg present"
+        );
+        assert_eq!(
+            crv,
+            Some(ciborium::value::Value::Integer(Integer::from(1))),
+            "crv present"
+        );
+
+        let x_bytes = x_bytes.expect("x coordinate present");
+        assert_eq!(x_bytes.len(), 32);
+        let y_bytes = y_bytes.expect("y coordinate present");
+        assert_eq!(y_bytes.len(), 32);
+
+        let reconstructed = credential_secret_from_bytes(CoseAlg::ES256, &secret_key.to_bytes())
+            .expect("reconstruct P-256 secret");
+        match reconstructed {
+            CredentialSecretKey::Es256(_) => {}
+            _ => panic!("unexpected key variant"),
         }
     }
 
@@ -416,8 +579,9 @@ mod tests {
         let (pk, sk) = trussed_mlkem::keypair(KemParamSet::MLKem512);
         let (ciphertext, shared_secret_client) =
             trussed_mlkem::encapsulate(KemParamSet::MLKem512, &pk);
-        let shared_secret_auth = trussed_mlkem::decapsulate(KemParamSet::MLKem512, &sk, &ciphertext)
-            .expect("ciphertext should be valid");
+        let shared_secret_auth =
+            trussed_mlkem::decapsulate(KemParamSet::MLKem512, &sk, &ciphertext)
+                .expect("ciphertext should be valid");
         let transcript_hash = b"transcript";
         let client_keys = derive_pqc_pin_uv_session_keys(&shared_secret_client.0, transcript_hash);
         let auth_keys = derive_pqc_pin_uv_session_keys(&shared_secret_auth.0, transcript_hash);
