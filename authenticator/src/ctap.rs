@@ -135,6 +135,23 @@ impl Drop for WaitingState {
     }
 }
 
+struct InterruptWorkGuard<'a> {
+    flag: &'a InterruptFlag,
+}
+
+impl<'a> InterruptWorkGuard<'a> {
+    fn begin(flag: &'a InterruptFlag) -> Self {
+        flag.set_working();
+        Self { flag }
+    }
+}
+
+impl<'a> Drop for InterruptWorkGuard<'a> {
+    fn drop(&mut self) {
+        self.flag.set_idle();
+    }
+}
+
 fn encrypt_shared_secret(key: &[u8; 32], plaintext: &[u8]) -> Result<Vec<u8>, u8> {
     if plaintext.len() % 16 != 0 {
         return Err(CTAP1_ERR_INVALID_PARAMETER);
@@ -771,6 +788,7 @@ where
     }
 
     fn await_user_presence(&mut self) -> Result<bool, u8> {
+        let _interrupt_guard = InterruptWorkGuard::begin(self.interrupt_flag);
         let mut waiting = WaitingState::begin();
         let mut waited_ms = 0u32;
         loop {
