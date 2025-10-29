@@ -154,6 +154,7 @@ fn main() {
         serial_number: None,
         vid: args.vid,
         pid: args.pid,
+        device_class: None,
     };
 
     log::info!("Initializing Trussed");
