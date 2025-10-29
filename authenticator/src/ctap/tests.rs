@@ -1050,6 +1050,63 @@ fn make_credential_returns_keepalive_cancel_when_cancelled() {
 }
 
 #[test]
+#[serial]
+fn make_credential_recovers_after_cancellation() {
+    let mut app = CtapApp::new(TestClient::new(), [0x25; 16]);
+    app.client
+        .set_presence_responses(vec![Err(consent::Error::Interrupted)]);
+    super::take_waiting_log();
+
+    let client_hash = vec![0x41; 32];
+    let rp = canonical_map(vec![(
+        Value::Text("id".into()),
+        Value::Text("example.com".into()),
+    )]);
+    let user = canonical_map(vec![(Value::Text("id".into()), Value::Bytes(vec![0x03]))]);
+    let params = Value::Array(vec![canonical_map(vec![
+        (Value::Text("type".into()), Value::Text("public-key".into())),
+        (
+            Value::Text("alg".into()),
+            Value::Integer(Integer::from(CoseAlg::ES256 as i32)),
+        ),
+    ])]);
+
+    let request = canonical_map(vec![
+        (
+            Value::Integer(Integer::from(1)),
+            Value::Bytes(client_hash.clone()),
+        ),
+        (Value::Integer(Integer::from(2)), rp),
+        (Value::Integer(Integer::from(3)), user),
+        (Value::Integer(Integer::from(4)), params),
+    ]);
+
+    let mut payload = Vec::new();
+    into_writer(&request, &mut payload).expect("serialize makeCredential request");
+    let result = app.handle_make_credential(&payload);
+    assert_eq!(result, Err(CTAP2_ERR_KEEPALIVE_CANCEL));
+    assert!(app.stored_credentials.is_empty());
+    let log = super::take_waiting_log();
+    assert!(!log.is_empty(), "waiting log must record activity");
+    assert_eq!(log.last(), Some(&false));
+    assert!(log.windows(2).any(|pair| pair == [true, false]));
+
+    app.client
+        .set_presence_responses(vec![Ok::<(), consent::Error>(())]);
+    super::take_waiting_log();
+
+    let response = app
+        .handle_make_credential(&payload)
+        .expect("makeCredential succeeds after cancellation");
+    assert_eq!(response[0], CTAP2_OK);
+    assert_eq!(app.stored_credentials.len(), 1);
+    let log = super::take_waiting_log();
+    assert!(!log.is_empty(), "waiting log must record activity");
+    assert_eq!(log.last(), Some(&false));
+    assert!(log.windows(2).any(|pair| pair == [true, false]));
+}
+
+#[test]
 fn get_assertion_es256_signature_verifies() {
     let mut app = CtapApp::new(TestClient::new(), [0x02; 16]);
     let rp_id = "example.com";
