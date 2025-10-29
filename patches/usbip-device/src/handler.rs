@@ -269,9 +269,26 @@ impl UsbIpBusInner {
             }
         };
 
+        let has_setup = cmd.setup != [0, 0, 0, 0, 0, 0, 0, 0];
+        let is_control_setup = header.ep == 0 && has_setup;
+
+        if is_control_setup {
+            match ep.get_in() {
+                Ok(ep_in) => {
+                    if !ep_in.data.is_empty() {
+                        log::debug!("clearing pending IN data for endpoint 0 after new SETUP");
+                        ep_in.data.clear();
+                    }
+                }
+                Err(err) => {
+                    log::debug!("failed to access IN pipe for endpoint 0: {:?}", err);
+                }
+            }
+        }
+
         // check wether we have a setup packet
         // NOTE: This assumes the control endpoints have no URBs pending
-        if cmd.setup != [0, 0, 0, 0, 0, 0, 0, 0] {
+        if has_setup {
             ep.get_out().unwrap().data.push_back(cmd.setup.to_vec());
             ep.setup_flag = true;
         }
@@ -367,5 +384,63 @@ impl UsbIpBusInner {
             .unwrap()
             .write_all(&response.to_vec().unwrap())
             .unwrap();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::Pipe;
+    use std::collections::VecDeque;
+
+    fn make_control_pipe() -> Pipe {
+        Pipe {
+            data: VecDeque::new(),
+            ty: EndpointType::Control,
+            max_packet_size: 64,
+            interval: 0,
+        }
+    }
+
+    #[test]
+    fn new_control_setup_clears_in_data() {
+        let mut bus = UsbIpBusInner::new();
+
+        bus.endpoint[0].pipe_in = Some(make_control_pipe());
+        bus.endpoint[0].pipe_out = Some(make_control_pipe());
+
+        if let Some(ref mut pipe_in) = bus.endpoint[0].pipe_in {
+            pipe_in.data.push_back(vec![0xAA; pipe_in.max_packet_size as usize]);
+        }
+
+        let header = UsbIpHeader {
+            command: UsbCmd::Request,
+            seqnum: 1,
+            devid: 2,
+            direction: Direction::IN,
+            ep: 0,
+        };
+
+        let cmd = UsbIpCmdSubmit {
+            transfer_flags: TransferFlags::empty(),
+            transfer_buffer_length: 0,
+            start_frame: 0,
+            number_of_packets: 0,
+            interval: 0,
+            setup: [1, 0, 0, 0, 0, 0, 0, 0],
+        };
+
+        bus.handle_cmd(header, cmd, Vec::new());
+
+        assert!(
+            bus.endpoint[0]
+                .pipe_in
+                .as_ref()
+                .expect("control IN pipe missing")
+                .data
+                .is_empty(),
+            "control endpoint IN data should be cleared before queuing IN request"
+        );
+        assert_eq!(bus.endpoint[0].pending_ins.len(), 1);
     }
 }
