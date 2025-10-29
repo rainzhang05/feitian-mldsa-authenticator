@@ -11,6 +11,8 @@ use std::{
 };
 use usb_device::{endpoint::EndpointType, UsbError};
 
+const ECONNRESET: i32 = 104;
+
 #[derive(Debug)]
 pub struct SocketHandler {
     listener: TcpListener,
@@ -260,62 +262,121 @@ impl UsbIpBusInner {
 
     /// Handle a [`UsbIpCmdSubmit`] package
     fn handle_cmd(&mut self, header: UsbIpHeader, cmd: UsbIpCmdSubmit, data: Vec<u8>) {
-        // Get the endpoint
-        let ep = match self.get_endpoint(header.ep as usize) {
-            Ok(ep) => ep,
-            Err(err) => {
-                log::warn!("reveiced message for unimplemented endpoint {:?}", err);
-                return;
-            }
-        };
+        let mut control_abort_headers = Vec::new();
 
-        let has_setup = cmd.setup != [0, 0, 0, 0, 0, 0, 0, 0];
-        let is_control_setup = header.ep == 0 && has_setup;
+        {
+            // Get the endpoint
+            let ep = match self.get_endpoint(header.ep as usize) {
+                Ok(ep) => ep,
+                Err(err) => {
+                    log::warn!("reveiced message for unimplemented endpoint {:?}", err);
+                    return;
+                }
+            };
 
-        if is_control_setup {
-            match ep.get_in() {
-                Ok(ep_in) => {
-                    if !ep_in.data.is_empty() {
-                        log::debug!("clearing pending IN data for endpoint 0 after new SETUP");
-                        ep_in.data.clear();
+            let has_setup = cmd.setup != [0, 0, 0, 0, 0, 0, 0, 0];
+            let is_control_setup = header.ep == 0 && has_setup;
+
+            if is_control_setup {
+                match ep.get_in() {
+                    Ok(ep_in) => {
+                        if !ep_in.data.is_empty() {
+                            log::debug!(
+                                "clearing pending IN data for endpoint 0 after new SETUP"
+                            );
+                            ep_in.data.clear();
+                        }
+                    }
+                    Err(err) => {
+                        log::debug!("failed to access IN pipe for endpoint 0: {:?}", err);
                     }
                 }
-                Err(err) => {
-                    log::debug!("failed to access IN pipe for endpoint 0: {:?}", err);
+
+                if !ep.pending_ins.is_empty() {
+                    log::debug!(
+                        "failing {} pending IN URBs for endpoint 0 after new SETUP",
+                        ep.pending_ins.len()
+                    );
+
+                    while let Some((pending_header, _, _)) = ep.pending_ins.pop_front() {
+                        control_abort_headers.push(pending_header);
+                    }
                 }
+            }
+
+            // check wether we have a setup packet
+            // NOTE: This assumes the control endpoints have no URBs pending
+            if has_setup {
+                ep.get_out().unwrap().data.push_back(cmd.setup.to_vec());
+                ep.setup_flag = true;
+            }
+
+            match header.direction {
+                Direction::OUT => {
+                    let ep_out = ep.get_out().unwrap();
+
+                    // pass the data into the correct buffers
+                    for chunk in data.chunks(ep_out.max_packet_size as usize) {
+                        ep_out.data.push_back(chunk.to_vec());
+                    }
+
+                    if cmd.transfer_flags.contains(TransferFlags::ZERO_PACKET)
+                        && ep_out.ty == EndpointType::Bulk
+                    {
+                        ep_out.data.push_back(vec![]);
+                    }
+
+                    self.ack_cmd_out(header.ep, header.seqnum, data.len());
+                }
+                Direction::IN => {
+                    let ep_addr = header.ep;
+                    ep.pending_ins.push_back((header, cmd, data));
+                    self.try_send_pending(ep_addr as usize);
+                }
+                _ => panic!(),
             }
         }
 
-        // check wether we have a setup packet
-        // NOTE: This assumes the control endpoints have no URBs pending
-        if has_setup {
-            ep.get_out().unwrap().data.push_back(cmd.setup.to_vec());
-            ep.setup_flag = true;
-        }
+        for pending_header in control_abort_headers {
+            let response = UsbIpResponse {
+                header: UsbIpHeader {
+                    command: UsbCmd::Response,
+                    seqnum: pending_header.seqnum,
+                    devid: 2,
+                    direction: Direction::IN,
+                    ep: pending_header.ep,
+                },
+                cmd: UsbIpResponseCmd::Cmd(UsbIpRetSubmit {
+                    status: -ECONNRESET,
+                    actual_length: 0,
+                    start_frame: 0,
+                    number_of_packets: 0,
+                    error_count: 0,
+                }),
+                data: vec![],
+            };
 
-        match header.direction {
-            Direction::OUT => {
-                let ep_out = ep.get_out().unwrap();
+            match self.handler.connection.as_mut() {
+                Some(connection) => {
+                    let response_bytes = response
+                        .to_vec()
+                        .expect("failed to serialize abort response");
 
-                // pass the data into the correct buffers
-                for chunk in data.chunks(ep_out.max_packet_size as usize) {
-                    ep_out.data.push_back(chunk.to_vec());
+                    if let Err(err) = connection.write_all(&response_bytes) {
+                        log::warn!(
+                            "failed to send abort response for seqnum {}: {:?}",
+                            pending_header.seqnum,
+                            err
+                        );
+                    }
                 }
-
-                if cmd.transfer_flags.contains(TransferFlags::ZERO_PACKET)
-                    && ep_out.ty == EndpointType::Bulk
-                {
-                    ep_out.data.push_back(vec![]);
+                None => {
+                    log::warn!(
+                        "dropping pending IN URB {} without an active connection",
+                        pending_header.seqnum
+                    );
                 }
-
-                self.ack_cmd_out(header.ep, header.seqnum, data.len());
             }
-            Direction::IN => {
-                let ep_addr = header.ep;
-                ep.pending_ins.push_back((header, cmd, data));
-                self.try_send_pending(ep_addr as usize);
-            }
-            _ => panic!(),
         }
     }
 
@@ -409,6 +470,27 @@ mod tests {
         bus.endpoint[0].pipe_in = Some(make_control_pipe());
         bus.endpoint[0].pipe_out = Some(make_control_pipe());
 
+        let stale_header = UsbIpHeader {
+            command: UsbCmd::Request,
+            seqnum: 42,
+            devid: 2,
+            direction: Direction::IN,
+            ep: 0,
+        };
+
+        let stale_cmd = UsbIpCmdSubmit {
+            transfer_flags: TransferFlags::empty(),
+            transfer_buffer_length: 0,
+            start_frame: 0,
+            number_of_packets: 0,
+            interval: 0,
+            setup: [0; 8],
+        };
+
+        bus.endpoint[0]
+            .pending_ins
+            .push_back((stale_header, stale_cmd, Vec::new()));
+
         if let Some(ref mut pipe_in) = bus.endpoint[0].pipe_in {
             pipe_in.data.push_back(vec![0xAA; pipe_in.max_packet_size as usize]);
         }
@@ -420,6 +502,8 @@ mod tests {
             direction: Direction::IN,
             ep: 0,
         };
+
+        let new_seqnum = header.seqnum;
 
         let cmd = UsbIpCmdSubmit {
             transfer_flags: TransferFlags::empty(),
@@ -437,10 +521,17 @@ mod tests {
                 .pipe_in
                 .as_ref()
                 .expect("control IN pipe missing")
-                .data
-                .is_empty(),
+            .data
+            .is_empty(),
             "control endpoint IN data should be cleared before queuing IN request"
         );
-        assert_eq!(bus.endpoint[0].pending_ins.len(), 1);
+
+        let pending_seqnums: Vec<_> = bus.endpoint[0]
+            .pending_ins
+            .iter()
+            .map(|(pending_header, _, _)| pending_header.seqnum)
+            .collect();
+
+        assert_eq!(pending_seqnums, vec![new_seqnum]);
     }
 }
