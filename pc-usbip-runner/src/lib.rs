@@ -41,17 +41,52 @@ pub type Client<D = CoreOnly> = ClientImplementation<'static, Syscall, D>;
 
 pub type InitPlatform = Box<dyn Fn(&mut Platform)>;
 
+#[derive(Clone, Copy, Debug)]
+pub struct DeviceClass {
+    pub class: u8,
+    pub sub_class: u8,
+    pub protocol: u8,
+}
+
+impl DeviceClass {
+    pub const fn new(class: u8, sub_class: u8, protocol: u8) -> Self {
+        Self {
+            class,
+            sub_class,
+            protocol,
+        }
+    }
+
+    pub const fn per_interface() -> Self {
+        Self::new(0x00, 0x00, 0x00)
+    }
+
+    pub const fn hid() -> Self {
+        Self::new(0x03, 0x00, 0x00)
+    }
+
+    pub const fn composite() -> Self {
+        Self::new(0xEF, 0x02, 0x01)
+    }
+}
+
 pub struct Options {
     pub manufacturer: Option<String>,
     pub product: Option<String>,
     pub serial_number: Option<String>,
     pub vid: u16,
     pub pid: u16,
+    pub device_class: Option<DeviceClass>,
 }
 
 impl Options {
     fn vid_pid(&self) -> UsbVidPid {
         UsbVidPid(self.vid, self.pid)
+    }
+
+    fn resolved_device_class(&self, ctaphid_enabled: bool, ccid_enabled: bool) -> DeviceClass {
+        self.device_class
+            .unwrap_or_else(|| infer_device_class(ctaphid_enabled, ccid_enabled))
     }
 }
 
@@ -277,7 +312,37 @@ fn build_device<'a, B: UsbBus>(
     if let Some(serial_number) = &options.serial_number {
         usb_builder = usb_builder.serial_number(serial_number);
     }
-    usb_builder.device_class(0x03).device_sub_class(0).build()
+    let ctaphid_enabled = cfg!(feature = "ctaphid");
+    let ccid_enabled = cfg!(feature = "ccid");
+    let device_class = options.resolved_device_class(ctaphid_enabled, ccid_enabled);
+
+    log::debug!(
+        "USB device descriptor class {:02x}/{:02x}/{:02x} (ctaphid: {}, ccid: {}, override: {})",
+        device_class.class,
+        device_class.sub_class,
+        device_class.protocol,
+        ctaphid_enabled,
+        ccid_enabled,
+        options.device_class.is_some()
+    );
+
+    usb_builder
+        .device_class(device_class.class)
+        .device_sub_class(device_class.sub_class)
+        .device_protocol(device_class.protocol)
+        .build()
+}
+
+fn infer_device_class(ctaphid_enabled: bool, ccid_enabled: bool) -> DeviceClass {
+    let interface_count = ctaphid_enabled as u8 + ccid_enabled as u8;
+
+    if ctaphid_enabled && interface_count == 1 {
+        DeviceClass::hid()
+    } else if interface_count > 1 {
+        DeviceClass::composite()
+    } else {
+        DeviceClass::per_interface()
+    }
 }
 
 #[derive(Default)]
