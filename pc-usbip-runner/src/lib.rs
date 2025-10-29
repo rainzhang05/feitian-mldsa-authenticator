@@ -221,18 +221,26 @@ where
                 let mut timeout_ccid = Timeout::new();
 
                 loop {
-                    thread::sleep(Duration::from_millis(5));
-                    usb_device.poll(&mut [
+                    let mut handled_usb_event = false;
+                    while usb_device.poll(&mut [
                         #[cfg(feature = "ctaphid")]
                         &mut ctaphid,
                         #[cfg(feature = "ccid")]
                         &mut ccid,
-                    ]);
+                    ]) {
+                        handled_usb_event = true;
+                    }
 
                     #[cfg(feature = "ctaphid")]
                     ctaphid::keepalive(&mut ctaphid, &mut timeout_ctaphid, _epoch);
                     #[cfg(feature = "ccid")]
                     ccid::keepalive(&mut ccid, &mut timeout_ccid, _epoch);
+
+                    // USB/IP adds host-side latency. Yield instead of sleeping so control
+                    // transfers can complete with minimal turnaround time.
+                    if !handled_usb_event {
+                        thread::yield_now();
+                    }
                 }
             });
 
@@ -245,11 +253,35 @@ where
 
             // apps task
             loop {
-                thread::sleep(Duration::from_millis(5));
+                let mut dispatched = false;
+
                 #[cfg(feature = "ctaphid")]
-                apps.with_ctaphid_apps(|apps| ctaphid_dispatch.poll(apps));
+                {
+                    let ctaphid_did_work = apps.with_ctaphid_apps(|apps| {
+                        let mut did_work = false;
+                        while ctaphid_dispatch.poll(apps) {
+                            did_work = true;
+                        }
+                        did_work
+                    });
+                    dispatched |= ctaphid_did_work;
+                }
+
                 #[cfg(feature = "ccid")]
-                apps.with_ccid_apps(|apps| apdu_dispatch.poll(apps));
+                {
+                    let ccid_did_work = apps.with_ccid_apps(|apps| {
+                        let mut did_work = false;
+                        while apdu_dispatch.poll(apps).is_some() {
+                            did_work = true;
+                        }
+                        did_work
+                    });
+                    dispatched |= ccid_did_work;
+                }
+
+                if !dispatched {
+                    thread::yield_now();
+                }
             }
         });
     }
