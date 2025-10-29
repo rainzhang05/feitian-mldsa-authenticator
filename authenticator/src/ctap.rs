@@ -26,17 +26,17 @@ use p256::{
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use trussed::client::{Client as TrussedClient, CryptoClient, FilesystemClient};
+use trussed::interrupt::InterruptFlag;
 use trussed::syscall;
+use trussed::try_syscall;
+use trussed::types::consent;
 #[cfg(not(test))]
-use trussed::types::PathBuf;
-#[cfg(not(test))]
-use trussed::{
-    try_syscall,
-    types::{Location, Message},
-};
+use trussed::types::{Location, Message, PathBuf};
 use trussed_mlkem::{self, Ciphertext, ParamSet as KemParamSet, SecretKey as KemSecretKey};
 use zeroize::Zeroize;
 
+#[cfg(test)]
+use std::sync::Mutex;
 use std::{cmp::Ordering, collections::VecDeque};
 
 fn canonical_fallback_cmp(left: &Value, right: &Value) -> Ordering {
@@ -84,6 +84,57 @@ fn canonical_map(mut entries: Vec<(Value, Value)>) -> Value {
 type Aes256CbcEnc = Encryptor<Aes256>;
 type Aes256CbcDec = Decryptor<Aes256>;
 
+#[cfg(test)]
+static WAITING_LOG: Mutex<Vec<bool>> = Mutex::new(Vec::new());
+
+#[cfg(test)]
+pub(crate) fn take_waiting_log() -> Vec<bool> {
+    WAITING_LOG
+        .lock()
+        .expect("waiting log mutex poisoned")
+        .drain(..)
+        .collect()
+}
+
+fn set_keepalive_waiting(waiting: bool) {
+    #[cfg(not(test))]
+    {
+        pc_usbip_runner::set_waiting(waiting);
+    }
+
+    #[cfg(test)]
+    {
+        WAITING_LOG
+            .lock()
+            .expect("waiting log mutex poisoned")
+            .push(waiting);
+    }
+}
+
+struct WaitingState {
+    active: bool,
+}
+
+impl WaitingState {
+    fn begin() -> Self {
+        set_keepalive_waiting(true);
+        Self { active: true }
+    }
+
+    fn clear(&mut self) {
+        if self.active {
+            set_keepalive_waiting(false);
+            self.active = false;
+        }
+    }
+}
+
+impl Drop for WaitingState {
+    fn drop(&mut self) {
+        self.clear();
+    }
+}
+
 fn encrypt_shared_secret(key: &[u8; 32], plaintext: &[u8]) -> Result<Vec<u8>, u8> {
     if plaintext.len() % 16 != 0 {
         return Err(CTAP1_ERR_INVALID_PARAMETER);
@@ -121,6 +172,7 @@ const CTAP2_ERR_UNSUPPORTED_ALGORITHM: u8 = 0x26;
 const CTAP2_ERR_INVALID_OPTION: u8 = 0x2C;
 const CTAP2_ERR_NO_CREDENTIALS: u8 = 0x2E;
 const CTAP1_ERR_INVALID_PARAMETER: u8 = 0x2D;
+const CTAP2_ERR_KEEPALIVE_CANCEL: u8 = 0x2D;
 const CTAP2_ERR_NOT_ALLOWED: u8 = 0x30;
 const CTAP2_ERR_PIN_INVALID: u8 = 0x31;
 const CTAP2_ERR_PIN_BLOCKED: u8 = 0x32;
@@ -134,6 +186,9 @@ const CTAP2_ERR_UNAUTHORIZED_PERMISSION: u8 = 0x40;
 
 const MAX_PIN_RETRIES: u8 = 8;
 const MAX_PIN_FAILURES_BEFORE_BLOCK: u8 = 3;
+
+const USER_PRESENCE_POLL_TIMEOUT_MS: u32 = 200;
+const USER_PRESENCE_MAX_WAIT_MS: u32 = 10_000;
 
 type HmacSha256 = Hmac<Sha256>;
 
@@ -575,6 +630,7 @@ pub struct CtapApp<C> {
     pending_assertion: Option<PendingAssertion>,
     attestation_private_key: Option<Vec<u8>>,
     attestation_certificate_chain: Option<Vec<Vec<u8>>>,
+    interrupt_flag: &'static InterruptFlag,
     #[cfg(test)]
     stored_credentials: Vec<StoredCredential>,
 }
@@ -595,6 +651,7 @@ where
             pending_assertion: None,
             attestation_private_key: None,
             attestation_certificate_chain: None,
+            interrupt_flag: Box::leak(Box::new(InterruptFlag::new())),
             #[cfg(test)]
             stored_credentials: Vec::new(),
         };
@@ -711,6 +768,58 @@ where
         let mut array = [0u8; N];
         array.copy_from_slice(bytes);
         Ok(array)
+    }
+
+    fn await_user_presence(&mut self) -> Result<bool, u8> {
+        let mut waiting = WaitingState::begin();
+        let mut waited_ms = 0u32;
+        loop {
+            if self.interrupt_flag.is_interrupted() {
+                waiting.clear();
+                return Err(CTAP2_ERR_KEEPALIVE_CANCEL);
+            }
+
+            let consent = match try_syscall!(self
+                .client
+                .confirm_user_present(USER_PRESENCE_POLL_TIMEOUT_MS))
+            {
+                Ok(reply) => reply,
+                Err(_) => {
+                    waiting.clear();
+                    return Err(CTAP2_ERR_PROCESSING);
+                }
+            };
+
+            match consent.result {
+                Ok(()) => {
+                    waiting.clear();
+                    return Ok(true);
+                }
+                Err(consent::Error::TimedOut) => {
+                    waited_ms = waited_ms.saturating_add(USER_PRESENCE_POLL_TIMEOUT_MS);
+                    if waited_ms >= USER_PRESENCE_MAX_WAIT_MS {
+                        waiting.clear();
+                        return Err(CTAP2_ERR_NOT_ALLOWED);
+                    }
+                }
+                Err(consent::Error::Interrupted) => {
+                    waiting.clear();
+                    return Err(CTAP2_ERR_KEEPALIVE_CANCEL);
+                }
+                Err(consent::Error::TimeoutNotImplemented) => {
+                    waiting.clear();
+                    return Err(CTAP2_ERR_NOT_ALLOWED);
+                }
+                Err(consent::Error::FailedToInterrupt) => {
+                    waiting.clear();
+                    return Err(CTAP2_ERR_PROCESSING);
+                }
+                Err(_) => {
+                    waiting.clear();
+                    return Err(CTAP2_ERR_NOT_ALLOWED);
+                }
+            }
+        }
     }
 
     fn credential_allows(
@@ -1557,6 +1666,7 @@ where
         rp_id: &str,
         credential_id: &[u8],
         cose_key: &[u8],
+        user_present: bool,
         uv: bool,
         sign_count: u32,
         extensions: Option<&[u8]>,
@@ -1568,7 +1678,10 @@ where
         let mut auth_data =
             Vec::with_capacity(32 + 1 + 4 + 16 + 2 + credential_id.len() + cose_key.len());
         auth_data.extend_from_slice(&rp_hash);
-        let mut flags = 0x40 | 0x01; // AT + UP
+        let mut flags = 0x40; // AT
+        if user_present {
+            flags |= 0x01;
+        }
         if uv {
             flags |= 0x04;
         }
@@ -1999,6 +2112,8 @@ where
 
         let cred_protect_value = cred_protect_requested.unwrap_or(1);
 
+        let user_present = self.await_user_presence()?;
+
         let (cose_key, secret_key) = create_credential(alg);
         let secret_key_bytes = secret_key.to_bytes();
         let credential_id_bytes = syscall!(self.client.random_bytes(32)).bytes;
@@ -2057,6 +2172,7 @@ where
             &rp_id,
             &credential_id,
             &cose_key,
+            user_present,
             uv_verified,
             initial_sign_count,
             extension_bytes.as_deref(),
@@ -2243,8 +2359,6 @@ where
             self.ensure_pin_token_permission_for_rp(PIN_PERMISSION_GA, &rp_id)?;
         }
 
-        let user_present = true;
-
         let mut credentials = self.load_credentials()?;
 
         let mut matching_indices: Vec<usize> = Vec::new();
@@ -2280,6 +2394,8 @@ where
                 return Err(CTAP2_ERR_NO_CREDENTIALS);
             }
         }
+
+        let user_present = self.await_user_presence()?;
 
         let chosen_index = matching_indices[0];
         let remaining_credentials: VecDeque<Vec<u8>> = matching_indices
@@ -2505,10 +2621,14 @@ where
     }
 }
 
-impl<C, const N: usize> App<'_, N> for CtapApp<C>
+impl<'interrupt, C, const N: usize> App<'interrupt, N> for CtapApp<C>
 where
     C: TrussedClient + FilesystemClient + CryptoClient,
 {
+    fn interrupt(&self) -> Option<&'interrupt InterruptFlag> {
+        Some(self.interrupt_flag)
+    }
+
     fn commands(&self) -> &'static [Command] {
         &[Command::Cbor]
     }

@@ -14,15 +14,16 @@ use p256::{
     },
     EncodedPoint, PublicKey as P256PublicKey, SecretKey as P256SecretKey,
 };
+use serial_test::serial;
 use sha2::{Digest, Sha256};
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use trussed::api::{reply, Reply, Request, RequestVariant};
 use trussed::client::{
     AttestationClient, CertificateClient, Client as TrussedClient, ClientResult, CounterClient,
     CryptoClient, FilesystemClient, FutureResult, ManagementClient, PollClient, UiClient,
 };
 use trussed::error::Error as TrussedError;
-use trussed::types::Message;
+use trussed::types::{consent, Message};
 use trussed_mlkem::{ParamSet as KemParamSet, SecretKey as KemSecretKey};
 use zeroize::Zeroize;
 
@@ -31,11 +32,19 @@ struct TestClient {
     pending: Option<Result<Reply, TrussedError>>,
     random_counter: u8,
     files: HashMap<Vec<u8>, Vec<u8>>,
+    presence_responses: VecDeque<consent::Result>,
 }
 
 impl TestClient {
     fn new() -> Self {
         Self::default()
+    }
+
+    fn set_presence_responses<I>(&mut self, responses: I)
+    where
+        I: IntoIterator<Item = consent::Result>,
+    {
+        self.presence_responses = responses.into_iter().collect();
     }
 
     fn dispatch(&mut self, request: Request) -> Result<Reply, TrussedError> {
@@ -63,6 +72,13 @@ impl TestClient {
                 } else {
                     Err(TrussedError::FilesystemReadFailure)
                 }
+            }
+            Request::RequestUserConsent(_req) => {
+                let result = self
+                    .presence_responses
+                    .pop_front()
+                    .unwrap_or(Ok::<(), consent::Error>(()));
+                Ok(Reply::from(reply::RequestUserConsent { result }))
             }
             _ => Err(TrussedError::FunctionNotSupported),
         }
@@ -882,6 +898,158 @@ fn make_credential_supports_es256() {
 }
 
 #[test]
+#[serial]
+fn make_credential_waits_for_user_presence() {
+    let mut app = CtapApp::new(TestClient::new(), [0x21; 16]);
+    app.client.set_presence_responses(vec![
+        Err(consent::Error::TimedOut),
+        Err(consent::Error::TimedOut),
+        Ok::<(), consent::Error>(()),
+    ]);
+    super::take_waiting_log();
+
+    let client_hash = vec![0x20; 32];
+    let rp = canonical_map(vec![(
+        Value::Text("id".into()),
+        Value::Text("example.com".into()),
+    )]);
+    let user = canonical_map(vec![(Value::Text("id".into()), Value::Bytes(vec![0x01]))]);
+    let params = Value::Array(vec![canonical_map(vec![
+        (Value::Text("type".into()), Value::Text("public-key".into())),
+        (
+            Value::Text("alg".into()),
+            Value::Integer(Integer::from(CoseAlg::ES256 as i32)),
+        ),
+    ])]);
+
+    let request = canonical_map(vec![
+        (
+            Value::Integer(Integer::from(1)),
+            Value::Bytes(client_hash.clone()),
+        ),
+        (Value::Integer(Integer::from(2)), rp),
+        (Value::Integer(Integer::from(3)), user),
+        (Value::Integer(Integer::from(4)), params),
+    ]);
+
+    let mut payload = Vec::new();
+    into_writer(&request, &mut payload).expect("serialize makeCredential request");
+    let response = app
+        .handle_make_credential(&payload)
+        .expect("makeCredential succeeds");
+    assert_eq!(response[0], CTAP2_OK);
+
+    let log = super::take_waiting_log();
+    assert!(!log.is_empty(), "waiting log must record activity");
+    assert_eq!(log.last(), Some(&false));
+    assert!(log.windows(2).any(|pair| pair == [true, false]));
+
+    let Value::Map(entries) = from_reader(&response[1..]).expect("decode response map") else {
+        panic!("response must be a map");
+    };
+    let auth_data = entries
+        .iter()
+        .find(|(k, _)| *k == Value::Integer(Integer::from(2)))
+        .and_then(|(_, v)| match v {
+            Value::Bytes(bytes) => Some(bytes.clone()),
+            _ => None,
+        })
+        .expect("authData present");
+    assert_eq!(auth_data[32] & 0x01, 0x01);
+}
+
+#[test]
+#[serial]
+fn make_credential_returns_not_allowed_when_presence_denied() {
+    let mut app = CtapApp::new(TestClient::new(), [0x22; 16]);
+    let attempts =
+        (super::USER_PRESENCE_MAX_WAIT_MS / super::USER_PRESENCE_POLL_TIMEOUT_MS) as usize;
+    app.client.set_presence_responses(
+        std::iter::repeat(Err(consent::Error::TimedOut))
+            .take(attempts)
+            .collect::<Vec<_>>(),
+    );
+    super::take_waiting_log();
+
+    let client_hash = vec![0x30; 32];
+    let rp = canonical_map(vec![(
+        Value::Text("id".into()),
+        Value::Text("example.com".into()),
+    )]);
+    let user = canonical_map(vec![(Value::Text("id".into()), Value::Bytes(vec![0x02]))]);
+    let params = Value::Array(vec![canonical_map(vec![
+        (Value::Text("type".into()), Value::Text("public-key".into())),
+        (
+            Value::Text("alg".into()),
+            Value::Integer(Integer::from(CoseAlg::ES256 as i32)),
+        ),
+    ])]);
+
+    let request = canonical_map(vec![
+        (
+            Value::Integer(Integer::from(1)),
+            Value::Bytes(client_hash.clone()),
+        ),
+        (Value::Integer(Integer::from(2)), rp),
+        (Value::Integer(Integer::from(3)), user),
+        (Value::Integer(Integer::from(4)), params),
+    ]);
+
+    let mut payload = Vec::new();
+    into_writer(&request, &mut payload).expect("serialize makeCredential request");
+    let result = app.handle_make_credential(&payload);
+    assert_eq!(result, Err(CTAP2_ERR_NOT_ALLOWED));
+    assert!(app.stored_credentials.is_empty());
+    let log = super::take_waiting_log();
+    assert!(!log.is_empty(), "waiting log must record activity");
+    assert_eq!(log.last(), Some(&false));
+    assert!(log.windows(2).any(|pair| pair == [true, false]));
+}
+
+#[test]
+#[serial]
+fn make_credential_returns_keepalive_cancel_when_cancelled() {
+    let mut app = CtapApp::new(TestClient::new(), [0x23; 16]);
+    app.client
+        .set_presence_responses(vec![Err(consent::Error::Interrupted)]);
+    super::take_waiting_log();
+
+    let client_hash = vec![0x40; 32];
+    let rp = canonical_map(vec![(
+        Value::Text("id".into()),
+        Value::Text("example.com".into()),
+    )]);
+    let user = canonical_map(vec![(Value::Text("id".into()), Value::Bytes(vec![0x03]))]);
+    let params = Value::Array(vec![canonical_map(vec![
+        (Value::Text("type".into()), Value::Text("public-key".into())),
+        (
+            Value::Text("alg".into()),
+            Value::Integer(Integer::from(CoseAlg::ES256 as i32)),
+        ),
+    ])]);
+
+    let request = canonical_map(vec![
+        (
+            Value::Integer(Integer::from(1)),
+            Value::Bytes(client_hash.clone()),
+        ),
+        (Value::Integer(Integer::from(2)), rp),
+        (Value::Integer(Integer::from(3)), user),
+        (Value::Integer(Integer::from(4)), params),
+    ]);
+
+    let mut payload = Vec::new();
+    into_writer(&request, &mut payload).expect("serialize makeCredential request");
+    let result = app.handle_make_credential(&payload);
+    assert_eq!(result, Err(CTAP2_ERR_KEEPALIVE_CANCEL));
+    assert!(app.stored_credentials.is_empty());
+    let log = super::take_waiting_log();
+    assert!(!log.is_empty(), "waiting log must record activity");
+    assert_eq!(log.last(), Some(&false));
+    assert!(log.windows(2).any(|pair| pair == [true, false]));
+}
+
+#[test]
 fn get_assertion_es256_signature_verifies() {
     let mut app = CtapApp::new(TestClient::new(), [0x02; 16]);
     let rp_id = "example.com";
@@ -958,6 +1126,172 @@ fn get_assertion_es256_signature_verifies() {
     verifying_key
         .verify(&message, &signature)
         .expect("ES256 signature verifies");
+}
+
+#[test]
+#[serial]
+fn get_assertion_waits_for_user_presence() {
+    let mut app = CtapApp::new(TestClient::new(), [0x24; 16]);
+    app.client
+        .set_presence_responses(vec![Ok::<(), consent::Error>(())]);
+
+    let make_client_hash = vec![0x50; 32];
+    let rp = canonical_map(vec![(
+        Value::Text("id".into()),
+        Value::Text("example.com".into()),
+    )]);
+    let user = canonical_map(vec![(Value::Text("id".into()), Value::Bytes(vec![0x11]))]);
+    let params = Value::Array(vec![canonical_map(vec![
+        (Value::Text("type".into()), Value::Text("public-key".into())),
+        (
+            Value::Text("alg".into()),
+            Value::Integer(Integer::from(CoseAlg::ES256 as i32)),
+        ),
+    ])]);
+
+    let make_request = canonical_map(vec![
+        (
+            Value::Integer(Integer::from(1)),
+            Value::Bytes(make_client_hash.clone()),
+        ),
+        (Value::Integer(Integer::from(2)), rp),
+        (Value::Integer(Integer::from(3)), user),
+        (Value::Integer(Integer::from(4)), params),
+    ]);
+
+    let mut payload = Vec::new();
+    into_writer(&make_request, &mut payload).expect("serialize makeCredential request");
+    app.handle_make_credential(&payload)
+        .expect("makeCredential succeeds");
+
+    let credential_id = app.stored_credentials[0].credential_id.clone();
+    super::take_waiting_log();
+
+    app.client.set_presence_responses(vec![
+        Err(consent::Error::TimedOut),
+        Ok::<(), consent::Error>(()),
+    ]);
+
+    let allow_list = Value::Array(vec![canonical_map(vec![
+        (Value::Text("type".into()), Value::Text("public-key".into())),
+        (
+            Value::Text("id".into()),
+            Value::Bytes(credential_id.clone()),
+        ),
+    ])]);
+    let get_client_hash = vec![0x51; 32];
+    let get_request = canonical_map(vec![
+        (
+            Value::Integer(Integer::from(1)),
+            Value::Text("example.com".into()),
+        ),
+        (
+            Value::Integer(Integer::from(2)),
+            Value::Bytes(get_client_hash.clone()),
+        ),
+        (Value::Integer(Integer::from(3)), allow_list),
+    ]);
+
+    let mut payload = Vec::new();
+    into_writer(&get_request, &mut payload).expect("serialize getAssertion request");
+    let response = app
+        .handle_get_assertion(&payload)
+        .expect("getAssertion succeeds");
+
+    let log = super::take_waiting_log();
+    assert!(!log.is_empty(), "waiting log must record activity");
+    assert_eq!(log.last(), Some(&false));
+    assert!(log.windows(2).any(|pair| pair == [true, false]));
+
+    let Value::Map(entries) = from_reader(&response[1..]).expect("decode response map") else {
+        panic!("response must be a map");
+    };
+    let auth_data = entries
+        .iter()
+        .find(|(k, _)| *k == Value::Integer(Integer::from(2)))
+        .and_then(|(_, v)| match v {
+            Value::Bytes(bytes) => Some(bytes.clone()),
+            _ => None,
+        })
+        .expect("authData present");
+    assert_eq!(auth_data[32] & 0x01, 0x01);
+}
+
+#[test]
+#[serial]
+fn get_assertion_returns_not_allowed_when_presence_denied() {
+    let mut app = CtapApp::new(TestClient::new(), [0x25; 16]);
+    app.client
+        .set_presence_responses(vec![Ok::<(), consent::Error>(())]);
+
+    let make_client_hash = vec![0x60; 32];
+    let rp = canonical_map(vec![(
+        Value::Text("id".into()),
+        Value::Text("example.com".into()),
+    )]);
+    let user = canonical_map(vec![(Value::Text("id".into()), Value::Bytes(vec![0x21]))]);
+    let params = Value::Array(vec![canonical_map(vec![
+        (Value::Text("type".into()), Value::Text("public-key".into())),
+        (
+            Value::Text("alg".into()),
+            Value::Integer(Integer::from(CoseAlg::ES256 as i32)),
+        ),
+    ])]);
+
+    let make_request = canonical_map(vec![
+        (
+            Value::Integer(Integer::from(1)),
+            Value::Bytes(make_client_hash.clone()),
+        ),
+        (Value::Integer(Integer::from(2)), rp),
+        (Value::Integer(Integer::from(3)), user),
+        (Value::Integer(Integer::from(4)), params),
+    ]);
+
+    let mut payload = Vec::new();
+    into_writer(&make_request, &mut payload).expect("serialize makeCredential request");
+    app.handle_make_credential(&payload)
+        .expect("makeCredential succeeds");
+
+    let credential_id = app.stored_credentials[0].credential_id.clone();
+    super::take_waiting_log();
+
+    let attempts =
+        (super::USER_PRESENCE_MAX_WAIT_MS / super::USER_PRESENCE_POLL_TIMEOUT_MS) as usize;
+    app.client.set_presence_responses(
+        std::iter::repeat(Err(consent::Error::TimedOut))
+            .take(attempts)
+            .collect::<Vec<_>>(),
+    );
+
+    let allow_list = Value::Array(vec![canonical_map(vec![
+        (Value::Text("type".into()), Value::Text("public-key".into())),
+        (
+            Value::Text("id".into()),
+            Value::Bytes(credential_id.clone()),
+        ),
+    ])]);
+    let get_client_hash = vec![0x61; 32];
+    let get_request = canonical_map(vec![
+        (
+            Value::Integer(Integer::from(1)),
+            Value::Text("example.com".into()),
+        ),
+        (
+            Value::Integer(Integer::from(2)),
+            Value::Bytes(get_client_hash.clone()),
+        ),
+        (Value::Integer(Integer::from(3)), allow_list),
+    ]);
+
+    let mut payload = Vec::new();
+    into_writer(&get_request, &mut payload).expect("serialize getAssertion request");
+    let result = app.handle_get_assertion(&payload);
+    assert_eq!(result, Err(CTAP2_ERR_NOT_ALLOWED));
+    let log = super::take_waiting_log();
+    assert!(!log.is_empty(), "waiting log must record activity");
+    assert_eq!(log.last(), Some(&false));
+    assert!(log.windows(2).any(|pair| pair == [true, false]));
 }
 
 #[test]

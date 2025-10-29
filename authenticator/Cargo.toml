@@ -24,8 +24,12 @@ ctaphid-app = "0.1"
 heapless-bytes = "0.3"
 p256 = { version = "0.13", features = ["ecdh"] }
 rand_core = "0.6"
+pc-usbip-runner = { path = "../pc-usbip-runner", package = "trussed-usbip" }
 
 # Use our local wrapper for ML‑DSA.  By enabling all parameter set features the
 # wrapper links to the stub C implementation for 44/65/87.
 trussed-mldsa = { path = "../trussed-mldsa", features = ["mldsa44", "mldsa65", "mldsa87"] }
 trussed-mlkem = { path = "../trussed-mlkem", features = ["mlkem512", "mlkem768", "mlkem1024"] }
+
+[dev-dependencies]
+serial_test = "2"
