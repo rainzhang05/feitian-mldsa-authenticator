@@ -23,6 +23,7 @@ serde = { version = "1", features = ["derive"] }
 ctaphid-app = "0.1"
 heapless-bytes = "0.3"
 p256 = { version = "0.13", features = ["ecdh"] }
+rand_core = "0.6"
 
 # Use our local wrapper for ML‑DSA.  By enabling all parameter set features the
 # wrapper links to the stub C implementation for 44/65/87.

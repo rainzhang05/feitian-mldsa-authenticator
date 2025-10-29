@@ -1,4 +1,5 @@
 use super::*;
+use crate::{credential_secret_from_bytes, CredentialSecretKey};
 use ciborium::{
     de::from_reader,
     ser::into_writer,
@@ -7,7 +8,10 @@ use ciborium::{
 use core::task::Poll;
 use p256::{
     ecdh::diffie_hellman,
-    ecdsa::{signature::Signer, Signature as P256EcdsaSignature, SigningKey},
+    ecdsa::{
+        signature::{Signer, Verifier},
+        Signature as P256EcdsaSignature, SigningKey,
+    },
     EncodedPoint, PublicKey as P256PublicKey, SecretKey as P256SecretKey,
 };
 use sha2::{Digest, Sha256};
@@ -186,6 +190,13 @@ fn assert_get_info_response(
             (Value::Text("type".into()), Value::Text("public-key".into())),
             (
                 Value::Text("alg".into()),
+                Value::Integer(Integer::from(CoseAlg::ES256 as i32)),
+            ),
+        ]),
+        canonical_map(vec![
+            (Value::Text("type".into()), Value::Text("public-key".into())),
+            (
+                Value::Text("alg".into()),
                 Value::Integer(Integer::from(CoseAlg::MLDSA44 as i32)),
             ),
         ]),
@@ -208,7 +219,11 @@ fn assert_get_info_response(
     let expected_map = canonical_map(vec![
         (
             Value::Integer(Integer::from(1)),
-            Value::Array(vec![Value::Text("FIDO_2_1".into())]),
+            Value::Array(vec![
+                Value::Text("FIDO_2_1".into()),
+                Value::Text("FIDO_2_0".into()),
+                Value::Text("U2F_V2".into()),
+            ]),
         ),
         (Value::Integer(Integer::from(2)), extensions),
         (
@@ -284,6 +299,7 @@ fn get_assertion_response_encoding_is_canonical() {
     let credential_id = vec![0xAA, 0xBB, 0xCC];
     let alg = CoseAlg::MLDSA44;
     let (public_key, secret_key) = create_credential(alg);
+    let secret_key_bytes = secret_key.to_bytes();
 
     app.stored_credentials.push(StoredCredential {
         rp_id: rp_id.to_string(),
@@ -293,7 +309,7 @@ fn get_assertion_response_encoding_is_canonical() {
         alg: alg as i32,
         credential_id: credential_id.clone(),
         public_key: public_key.clone(),
-        secret_key: secret_key.0.clone(),
+        secret_key: secret_key_bytes.clone(),
         cred_random_with_uv: Some(vec![0x10; 32]),
         cred_random_without_uv: Some(vec![0x20; 32]),
         cred_protect: Some(1),
@@ -388,6 +404,7 @@ fn get_next_assertion_preserves_new_credentials() {
     let client_hash = vec![0x66; 32];
 
     let (pk1, sk1) = create_credential(CoseAlg::MLDSA44);
+    let sk1_bytes = sk1.to_bytes();
     app.stored_credentials.push(StoredCredential {
         rp_id: rp_id.to_string(),
         user_id: vec![0x01],
@@ -396,7 +413,7 @@ fn get_next_assertion_preserves_new_credentials() {
         alg: CoseAlg::MLDSA44 as i32,
         credential_id: vec![0xA1],
         public_key: pk1.clone(),
-        secret_key: sk1.0.clone(),
+        secret_key: sk1_bytes.clone(),
         cred_random_with_uv: Some(vec![0x10; 32]),
         cred_random_without_uv: Some(vec![0x11; 32]),
         cred_protect: Some(1),
@@ -404,6 +421,7 @@ fn get_next_assertion_preserves_new_credentials() {
     });
 
     let (pk2, sk2) = create_credential(CoseAlg::MLDSA44);
+    let sk2_bytes = sk2.to_bytes();
     app.stored_credentials.push(StoredCredential {
         rp_id: rp_id.to_string(),
         user_id: vec![0x02],
@@ -412,7 +430,7 @@ fn get_next_assertion_preserves_new_credentials() {
         alg: CoseAlg::MLDSA44 as i32,
         credential_id: vec![0xA2],
         public_key: pk2.clone(),
-        secret_key: sk2.0.clone(),
+        secret_key: sk2_bytes.clone(),
         cred_random_with_uv: Some(vec![0x12; 32]),
         cred_random_without_uv: Some(vec![0x13; 32]),
         cred_protect: Some(1),
@@ -461,6 +479,7 @@ fn get_next_assertion_preserves_new_credentials() {
     assert_eq!(total_credentials, 2);
 
     let (pk3, sk3) = create_credential(CoseAlg::MLDSA44);
+    let sk3_bytes = sk3.to_bytes();
     app.stored_credentials.push(StoredCredential {
         rp_id: "new.example".into(),
         user_id: vec![0x03],
@@ -469,7 +488,7 @@ fn get_next_assertion_preserves_new_credentials() {
         alg: CoseAlg::MLDSA44 as i32,
         credential_id: vec![0xA3],
         public_key: pk3.clone(),
-        secret_key: sk3.0.clone(),
+        secret_key: sk3_bytes.clone(),
         cred_random_with_uv: Some(vec![0x14; 32]),
         cred_random_without_uv: Some(vec![0x15; 32]),
         cred_protect: Some(1),
@@ -525,6 +544,7 @@ fn get_assertion_without_pin_uv_uses_presence_only() {
     let credential_id = vec![0xAA, 0xBB, 0xCC];
     let alg = CoseAlg::MLDSA44;
     let (public_key, secret_key) = create_credential(alg);
+    let secret_key_bytes = secret_key.to_bytes();
 
     app.stored_credentials.push(StoredCredential {
         rp_id: rp_id.to_string(),
@@ -534,7 +554,7 @@ fn get_assertion_without_pin_uv_uses_presence_only() {
         alg: alg as i32,
         credential_id: credential_id.clone(),
         public_key: public_key.clone(),
-        secret_key: secret_key.0.clone(),
+        secret_key: secret_key_bytes.clone(),
         cred_random_with_uv: Some(vec![0x30; 32]),
         cred_random_without_uv: Some(vec![0x40; 32]),
         cred_protect: Some(1),
@@ -593,6 +613,7 @@ fn get_assertion_with_invalid_pin_uv_auth_param_fails() {
     let credential_id = vec![0xAA, 0xBB, 0xCC];
     let alg = CoseAlg::MLDSA44;
     let (public_key, secret_key) = create_credential(alg);
+    let secret_key_bytes = secret_key.to_bytes();
 
     app.stored_credentials.push(StoredCredential {
         rp_id: rp_id.to_string(),
@@ -602,7 +623,7 @@ fn get_assertion_with_invalid_pin_uv_auth_param_fails() {
         alg: alg as i32,
         credential_id: credential_id.clone(),
         public_key: public_key.clone(),
-        secret_key: secret_key.0.clone(),
+        secret_key: secret_key_bytes.clone(),
         cred_random_with_uv: Some(vec![0x50; 32]),
         cred_random_without_uv: Some(vec![0x60; 32]),
         cred_protect: Some(1),
@@ -758,6 +779,185 @@ fn make_credential_includes_extensions() {
         })
         .expect("credProtect extension present");
     assert_eq!(cred_protect_value, 3);
+}
+
+#[test]
+fn make_credential_supports_es256() {
+    let mut app = CtapApp::new(TestClient::new(), [0x01; 16]);
+    let client_hash = vec![0x10; 32];
+    let rp = canonical_map(vec![(
+        Value::Text("id".into()),
+        Value::Text("example.com".into()),
+    )]);
+    let user = canonical_map(vec![(Value::Text("id".into()), Value::Bytes(vec![0xAA]))]);
+    let params = Value::Array(vec![canonical_map(vec![
+        (Value::Text("type".into()), Value::Text("public-key".into())),
+        (
+            Value::Text("alg".into()),
+            Value::Integer(Integer::from(CoseAlg::ES256 as i32)),
+        ),
+    ])]);
+
+    let request = canonical_map(vec![
+        (
+            Value::Integer(Integer::from(1)),
+            Value::Bytes(client_hash.clone()),
+        ),
+        (Value::Integer(Integer::from(2)), rp),
+        (Value::Integer(Integer::from(3)), user),
+        (Value::Integer(Integer::from(4)), params),
+    ]);
+
+    let mut payload = Vec::new();
+    into_writer(&request, &mut payload).expect("serialize makeCredential request");
+    let response = app
+        .handle_make_credential(&payload)
+        .expect("makeCredential succeeds");
+    assert_eq!(response[0], CTAP2_OK);
+
+    assert_eq!(app.stored_credentials.len(), 1);
+    let credential = &app.stored_credentials[0];
+    assert_eq!(credential.alg, CoseAlg::ES256 as i32);
+    assert_eq!(credential.secret_key.len(), 32);
+
+    let Value::Map(entries) =
+        from_reader(credential.public_key.as_slice()).expect("decode ES256 COSE key")
+    else {
+        panic!("public key must be a map");
+    };
+
+    let mut kty = None;
+    let mut alg = None;
+    let mut crv = None;
+    let mut x_len = None;
+    let mut y_len = None;
+
+    for (key, value) in entries {
+        if let Value::Integer(label) = key {
+            let label_value: i128 = label.clone().into();
+            match label_value {
+                1 => kty = Some(value),
+                3 => alg = Some(value),
+                -1 => crv = Some(value),
+                -2 => {
+                    if let Value::Bytes(bytes) = value {
+                        x_len = Some(bytes.len());
+                    }
+                }
+                -3 => {
+                    if let Value::Bytes(bytes) = value {
+                        y_len = Some(bytes.len());
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+
+    assert_eq!(
+        kty,
+        Some(Value::Integer(Integer::from(2))),
+        "kty must be EC2"
+    );
+    assert_eq!(
+        alg,
+        Some(Value::Integer(Integer::from(CoseAlg::ES256 as i32))),
+        "alg must be ES256"
+    );
+    assert_eq!(
+        crv,
+        Some(Value::Integer(Integer::from(1))),
+        "curve must be P-256"
+    );
+    assert_eq!(x_len, Some(32));
+    assert_eq!(y_len, Some(32));
+
+    let reconstructed =
+        credential_secret_from_bytes(CoseAlg::ES256, credential.secret_key.as_slice())
+            .expect("reconstruct ES256 secret key");
+    match reconstructed {
+        CredentialSecretKey::Es256(_) => {}
+        _ => panic!("expected ES256 secret key variant"),
+    }
+}
+
+#[test]
+fn get_assertion_es256_signature_verifies() {
+    let mut app = CtapApp::new(TestClient::new(), [0x02; 16]);
+    let rp_id = "example.com";
+    let client_hash = vec![0x99; 32];
+
+    let (public_key, secret_key) = create_credential(CoseAlg::ES256);
+    let verifying_key = match &secret_key {
+        CredentialSecretKey::Es256(sk) => sk.verifying_key(),
+        _ => panic!("expected ES256 secret key"),
+    };
+    let secret_key_bytes = secret_key.to_bytes();
+
+    app.stored_credentials.push(StoredCredential {
+        rp_id: rp_id.to_string(),
+        user_id: vec![0x01],
+        user_name: None,
+        user_display_name: None,
+        alg: CoseAlg::ES256 as i32,
+        credential_id: vec![0xA1, 0xB2],
+        public_key: public_key.clone(),
+        secret_key: secret_key_bytes.clone(),
+        cred_random_with_uv: None,
+        cred_random_without_uv: None,
+        cred_protect: Some(1),
+        sign_count: 0,
+    });
+
+    let request = canonical_map(vec![
+        (
+            Value::Integer(Integer::from(1)),
+            Value::Text(rp_id.to_string()),
+        ),
+        (
+            Value::Integer(Integer::from(2)),
+            Value::Bytes(client_hash.clone()),
+        ),
+    ]);
+
+    let mut payload = Vec::new();
+    into_writer(&request, &mut payload).expect("serialize getAssertion request");
+    let response = app
+        .handle_get_assertion(&payload)
+        .expect("getAssertion succeeds");
+    assert_eq!(response[0], CTAP2_OK);
+
+    let Value::Map(entries) = from_reader(&response[1..]).expect("decode getAssertion response")
+    else {
+        panic!("response must be a map");
+    };
+
+    let mut auth_data_bytes = None;
+    let mut signature_bytes = None;
+    for (key, value) in entries {
+        if key == Value::Integer(Integer::from(2)) {
+            if let Value::Bytes(bytes) = value {
+                auth_data_bytes = Some(bytes);
+            }
+        } else if key == Value::Integer(Integer::from(3)) {
+            if let Value::Bytes(bytes) = value {
+                signature_bytes = Some(bytes);
+            }
+        }
+    }
+
+    let auth_data_bytes = auth_data_bytes.expect("authData present");
+    let signature_bytes = signature_bytes.expect("signature present");
+
+    let mut message = Vec::new();
+    message.extend_from_slice(&auth_data_bytes);
+    message.extend_from_slice(&client_hash);
+
+    let signature =
+        P256EcdsaSignature::from_der(&signature_bytes).expect("signature must be valid DER");
+    verifying_key
+        .verify(&message, &signature)
+        .expect("ES256 signature verifies");
 }
 
 #[test]
@@ -1265,6 +1465,7 @@ fn get_assertion_rejects_mismatched_rp_binding() {
     let credential_id = vec![0xAA, 0xBB];
     let alg = CoseAlg::MLDSA44;
     let (public_key, secret_key) = create_credential(alg);
+    let secret_key_bytes = secret_key.to_bytes();
     app.stored_credentials.push(StoredCredential {
         rp_id: "example.com".into(),
         user_id: vec![0x01],
@@ -1273,7 +1474,7 @@ fn get_assertion_rejects_mismatched_rp_binding() {
         alg: alg as i32,
         credential_id: credential_id.clone(),
         public_key: public_key.clone(),
-        secret_key: secret_key.0.clone(),
+        secret_key: secret_key_bytes.clone(),
         cred_random_with_uv: None,
         cred_random_without_uv: None,
         cred_protect: Some(1),

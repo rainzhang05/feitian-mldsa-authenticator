@@ -1,8 +1,8 @@
 use crate::{
-    cose_akp_key_map, cose_alg_for_kem_param_set, create_credential, decrypt_classic_pin_block,
-    decrypt_pqc_pin_block, derive_classic_pin_uv_session_keys, derive_pqc_pin_uv_session_keys,
-    encrypt_classic_pin_block, encrypt_pqc_pin_block, sign_challenge, ClassicPinProtocol, CoseAlg,
-    PinUvSessionKeys, PIN_UV_AUTH_PROTOCOL_PQC,
+    cose_akp_key_map, cose_alg_for_kem_param_set, create_credential, credential_secret_from_bytes,
+    decrypt_classic_pin_block, decrypt_pqc_pin_block, derive_classic_pin_uv_session_keys,
+    derive_pqc_pin_uv_session_keys, encrypt_classic_pin_block, encrypt_pqc_pin_block,
+    sign_challenge, ClassicPinProtocol, CoseAlg, PinUvSessionKeys, PIN_UV_AUTH_PROTOCOL_PQC,
 };
 
 use aes::Aes256;
@@ -38,7 +38,6 @@ use trussed_mlkem::{self, Ciphertext, ParamSet as KemParamSet, SecretKey as KemS
 use zeroize::Zeroize;
 
 use std::{cmp::Ordering, collections::VecDeque};
-use trussed_mldsa::SecretKey;
 
 fn canonical_fallback_cmp(left: &Value, right: &Value) -> Ordering {
     let mut left_bytes = Vec::new();
@@ -1626,7 +1625,11 @@ where
 
         map.push((
             Value::Integer(Integer::from(1)),
-            Value::Array(vec![Value::Text("FIDO_2_1".into())]),
+            Value::Array(vec![
+                Value::Text("FIDO_2_1".into()),
+                Value::Text("FIDO_2_0".into()),
+                Value::Text("U2F_V2".into()),
+            ]),
         ));
         map.push((
             Value::Integer(Integer::from(3)),
@@ -1676,18 +1679,23 @@ where
             Value::Integer(Integer::from(PinState::MIN_PIN_LENGTH as u64)),
         ));
 
-        let algorithms = [-48, -49, -50]
-            .into_iter()
-            .map(|alg| {
-                canonical_map(vec![
-                    (Value::Text("type".into()), Value::Text("public-key".into())),
-                    (
-                        Value::Text("alg".into()),
-                        Value::Integer(Integer::from(alg)),
-                    ),
-                ])
-            })
-            .collect();
+        let algorithms = [
+            CoseAlg::ES256,
+            CoseAlg::MLDSA44,
+            CoseAlg::MLDSA65,
+            CoseAlg::MLDSA87,
+        ]
+        .into_iter()
+        .map(|alg| {
+            canonical_map(vec![
+                (Value::Text("type".into()), Value::Text("public-key".into())),
+                (
+                    Value::Text("alg".into()),
+                    Value::Integer(Integer::from(alg as i32)),
+                ),
+            ])
+        })
+        .collect();
         map.push((Value::Integer(Integer::from(10)), Value::Array(algorithms)));
 
         let transports = Value::Array(vec![Value::Text("usb".into())]);
@@ -1992,6 +2000,7 @@ where
         let cred_protect_value = cred_protect_requested.unwrap_or(1);
 
         let (cose_key, secret_key) = create_credential(alg);
+        let secret_key_bytes = secret_key.to_bytes();
         let credential_id_bytes = syscall!(self.client.random_bytes(32)).bytes;
         let credential_id = credential_id_bytes.to_vec();
 
@@ -2017,7 +2026,7 @@ where
             alg: alg as i32,
             credential_id: credential_id.clone(),
             public_key: cose_key.clone(),
-            secret_key: secret_key.0.clone(),
+            secret_key: secret_key_bytes.clone(),
             cred_random_with_uv: Some(cred_random_with_uv.clone()),
             cred_random_without_uv: Some(cred_random_without_uv.clone()),
             cred_protect: Some(cred_protect_value),
@@ -2310,7 +2319,8 @@ where
             )
         };
 
-        let signing_key = SecretKey(secret_key_bytes.clone());
+        let signing_key = credential_secret_from_bytes(alg, &secret_key_bytes)
+            .map_err(|_| CTAP2_ERR_PROCESSING)?;
         let mut extension_entries = Vec::new();
         let mut pending_hmac_secret = None;
         if let Some(ref request) = hmac_secret_request {
@@ -2421,7 +2431,8 @@ where
         let cred_random_with_uv = credential.cred_random_with_uv.clone();
         let cred_random_without_uv = credential.cred_random_without_uv.clone();
 
-        let signing_key = SecretKey(secret_key_bytes.clone());
+        let signing_key = credential_secret_from_bytes(alg, &secret_key_bytes)
+            .map_err(|_| CTAP2_ERR_PROCESSING)?;
         let mut extension_entries = Vec::new();
         if let Some(ref hmac_state) = pending.hmac_secret {
             let cred_random = if pending.user_verified {
