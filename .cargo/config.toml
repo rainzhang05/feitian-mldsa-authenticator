@@ -1,4 +1,0 @@
-[build]
-rustflags = [
-  "-C", "link-args=-Wl,-rpath=/home/rainzhang05/feitian-mldsa-authenticator/prebuilt_liboqs/linux-aarch64/lib"
-]
