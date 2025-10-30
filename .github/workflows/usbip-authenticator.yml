@@ -49,7 +49,10 @@ from typing import Optional
 
 
 def find_bus_id(output: str) -> Optional[str]:
-    pattern = re.compile(r"^\s*-\s*([0-9]+-[0-9]+):.*Feitian", re.MULTILINE)
+    pattern = re.compile(
+        r"^\s*(?:-\s*busid\s+)?([0-9]+-[0-9]+)(?::|\s).*Feitian",
+        re.MULTILINE,
+    )
     match = pattern.search(output)
     if match:
         return match.group(1)
