@@ -8,11 +8,11 @@ fn workspace_root() -> PathBuf {
 }
 
 fn lib_directory(root: &Path) -> PathBuf {
-    root.join("prebuilt_liboqs/linux-x86_64/lib")
+    root.join("prebuilt_liboqs/linux-aarch64/lib")
 }
 
 fn include_directory(root: &Path) -> PathBuf {
-    root.join("prebuilt_liboqs/linux-x86_64/include")
+    root.join("prebuilt_liboqs/linux-aarch64/include")
 }
 
 fn ensure_symbol(lib: &Path, symbol: &str) {
