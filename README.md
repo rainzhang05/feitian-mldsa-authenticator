@@ -100,7 +100,7 @@ If you build liboqs yourself, ensure the resulting shared library matches the ta
 The HID runner provisions a virtual authenticator through `/dev/uhid`, creating a `hidraw` node that browsers can use transparently. A single command launches the service in the foreground:
 
 ```bash
-RUST_LOG=info cargo run -p pc-hid-runner -- start
+RUST_LOG=info cargo run -p pc-hid-runner -- start --foreground
 ```
 
 Useful flags:
@@ -110,7 +110,7 @@ Useful flags:
 - `--suppress-attestation` — mask attestation certs for privacy testing
 - `--pqc-policy <prefer|required|disabled>` — choose the PQC PIN/UV transport policy
 
-The CLI also exposes `status` and `stop` subcommands that inspect or terminate a background daemon launched via `start --daemon`.
+Omit `--foreground` to run the service as a background daemon. The CLI also exposes `status` and `stop` subcommands that inspect or terminate that daemonised instance.
 
 ## Troubleshooting
 
