@@ -18,12 +18,32 @@ jobs:
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-unknown-linux-gnu
 
-      - name: Build workspace
-        run: cargo build --workspace --all-targets
+      - name: Install aarch64 build tooling
+        run: |
+          set -euxo pipefail
+          sudo apt-get update
+          sudo apt-get install -y \
+            gcc-aarch64-linux-gnu \
+            libc6-dev-arm64-cross \
+            qemu-user
 
-      - name: Run tests
-        run: cargo test --workspace --all-targets
+      - name: Build workspace (aarch64)
+        env:
+          CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER: aarch64-linux-gnu-gcc
+          CC_aarch64_unknown_linux_gnu: aarch64-linux-gnu-gcc
+          AR_aarch64_unknown_linux_gnu: aarch64-linux-gnu-ar
+        run: cargo build --workspace --all-targets --target aarch64-unknown-linux-gnu
+
+      - name: Run tests (aarch64)
+        env:
+          CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER: aarch64-linux-gnu-gcc
+          CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_RUNNER: "qemu-aarch64 -L /usr/aarch64-linux-gnu"
+          CC_aarch64_unknown_linux_gnu: aarch64-linux-gnu-gcc
+          AR_aarch64_unknown_linux_gnu: aarch64-linux-gnu-ar
+        run: cargo test --workspace --all-targets --target aarch64-unknown-linux-gnu
 
       - name: Install usbip tooling
         run: |
