@@ -249,9 +249,6 @@ impl UsbipRuntime {
 impl Drop for UsbipRuntime {
     fn drop(&mut self) {
         unsafe {
-            drop(Box::from_raw(self.usb_device.as_ptr()));
-            drop(Box::from_raw(self.allocator.as_ptr()));
-
             #[cfg(feature = "ctaphid")]
             {
                 self.ctaphid_dispatch.take();
@@ -276,6 +273,9 @@ impl Drop for UsbipRuntime {
                     drop(Box::from_raw(contactless.as_ptr()));
                 }
             }
+
+            drop(Box::from_raw(self.usb_device.as_ptr()));
+            drop(Box::from_raw(self.allocator.as_ptr()));
         }
     }
 }
