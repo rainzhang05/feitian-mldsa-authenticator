@@ -2,6 +2,9 @@
 
 use trussed_host_runner::Transport;
 
+#[cfg(feature = "ctaphid")]
+mod ctaphid;
+
 #[cfg(target_os = "linux")]
 mod linux;
 
