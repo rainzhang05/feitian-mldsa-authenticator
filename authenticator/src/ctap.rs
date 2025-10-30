@@ -652,6 +652,7 @@ pub struct CtapApp<C> {
     attestation_certificate_chain: Option<Vec<Vec<u8>>>,
     keepalive_callback: fn(bool),
     interrupt_flag: &'static InterruptFlag,
+    auto_user_presence: bool,
     #[cfg(test)]
     stored_credentials: Vec<StoredCredential>,
 }
@@ -674,6 +675,7 @@ where
             attestation_certificate_chain: None,
             keepalive_callback: noop_keepalive,
             interrupt_flag: Box::leak(Box::new(InterruptFlag::new())),
+            auto_user_presence: false,
             #[cfg(test)]
             stored_credentials: Vec::new(),
         };
@@ -687,6 +689,10 @@ where
 
     pub fn set_keepalive_callback(&mut self, callback: fn(bool)) {
         self.keepalive_callback = callback;
+    }
+
+    pub fn set_auto_user_presence(&mut self, enabled: bool) {
+        self.auto_user_presence = enabled;
     }
 
     pub fn suppress_attestation(&mut self, suppress: bool) {
@@ -799,6 +805,10 @@ where
     fn await_user_presence(&mut self) -> Result<bool, u8> {
         let _interrupt_guard = InterruptWorkGuard::begin(self.interrupt_flag);
         let mut waiting = WaitingState::begin(self.keepalive_callback);
+        if self.auto_user_presence {
+            waiting.clear();
+            return Ok(true);
+        }
         let mut waited_ms = 0u32;
         loop {
             if self.interrupt_flag.is_interrupted() {
