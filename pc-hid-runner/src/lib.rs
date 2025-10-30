@@ -1,3 +1,4 @@
+pub mod cli;
 pub mod permissions;
 pub mod service;
 pub mod transport;

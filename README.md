@@ -71,6 +71,34 @@ cargo build
 cargo build --release
 ```
 
+## Run the UHID authenticator service
+
+The `pc-hid-runner` crate exposes a CLI for starting, stopping, and
+querying the UHID-backed authenticator service. During development you can
+run it directly with Cargo:
+
+```bash
+cargo run -p pc-hid-runner -- start --foreground
+```
+
+The `--foreground` flag keeps the process attached to your terminal so you
+can see logs. Omit the flag to daemonize the service; the PID file and logs
+are written under the configured state directory (default:
+`~/.local/share/feitian-mldsa-authenticator`).
+
+When installed via `cargo install --path pc-hid-runner`, the same interface
+is available directly:
+
+```bash
+pc-hid-runner start --foreground
+pc-hid-runner status
+pc-hid-runner stop
+```
+
+Use `pc-hid-runner --help` or `pc-hid-runner start --help` to review the
+available options for VID/PID overrides, PQC policy, attestation controls,
+and storage location.
+
 ## Run the USB/IP runner
 
 Terminal 1 — start the runner:
