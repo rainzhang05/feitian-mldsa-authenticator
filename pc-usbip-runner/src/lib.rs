@@ -1,342 +1,208 @@
+#![cfg_attr(not(any(feature = "ctaphid", feature = "ccid")), allow(dead_code))]
+
 #[cfg(feature = "ccid")]
 mod ccid;
 #[cfg(feature = "ctaphid")]
 mod ctaphid;
 
-use std::{
-    marker::PhantomData,
-    sync::{
-        atomic::{AtomicBool, Ordering},
-        mpsc::{self, Sender},
-    },
-    thread,
-    time::{Duration, Instant},
-};
+use std::{io, thread, time::Instant};
 
-use littlefs2_core::DynFilesystem;
-use rand_chacha::ChaCha8Rng;
-use rand_core::SeedableRng as _;
-use trussed::{
-    backend::{CoreOnly, Dispatch},
-    pipe::ServiceEndpoint,
-    platform,
-    service::Service,
-    store,
-    virt::UserInterface,
-    ClientImplementation,
-};
+#[cfg(feature = "ccid")]
+use apdu_dispatch::interchanges::Data;
+#[cfg(feature = "ctaphid")]
+use ctaphid_dispatch::{self, Channel, DEFAULT_MESSAGE_SIZE};
+use trussed::backend::Dispatch;
 use usb_device::{
-    bus::{UsbBus, UsbBusAllocator},
+    bus::UsbBusAllocator,
     device::{UsbDevice, UsbDeviceBuilder, UsbVidPid},
 };
 use usbip_device::UsbIpBus;
 
-static IS_WAITING: AtomicBool = AtomicBool::new(false);
+#[cfg(feature = "ccid")]
+use usbd_ccid::Ccid;
+#[cfg(feature = "ctaphid")]
+use usbd_ctaphid::CtapHid;
 
-pub fn set_waiting(waiting: bool) {
-    IS_WAITING.store(waiting, Ordering::Relaxed)
-}
+pub use transport_core::{
+    set_waiting, waiting_for_user_presence, Apps, Builder, Client, DeviceClass, Options, Platform,
+    Runner, Store, Syscall, Timeout, Transport,
+};
 
-pub type Client<D = CoreOnly> = ClientImplementation<'static, Syscall, D>;
-
-pub type InitPlatform = Box<dyn Fn(&mut Platform)>;
-
-#[derive(Clone, Copy, Debug)]
-pub struct DeviceClass {
-    pub class: u8,
-    pub sub_class: u8,
-    pub protocol: u8,
-}
-
-impl DeviceClass {
-    pub const fn new(class: u8, sub_class: u8, protocol: u8) -> Self {
-        Self {
-            class,
-            sub_class,
-            protocol,
-        }
-    }
-
-    pub const fn per_interface() -> Self {
-        Self::new(0x00, 0x00, 0x00)
-    }
-
-    pub const fn hid() -> Self {
-        Self::new(0x03, 0x00, 0x00)
-    }
-
-    pub const fn composite() -> Self {
-        Self::new(0xEF, 0x02, 0x01)
-    }
-}
-
-pub struct Options {
-    pub manufacturer: Option<String>,
-    pub product: Option<String>,
-    pub serial_number: Option<String>,
-    pub vid: u16,
-    pub pid: u16,
-    pub device_class: Option<DeviceClass>,
-}
-
-impl Options {
-    fn vid_pid(&self) -> UsbVidPid {
-        UsbVidPid(self.vid, self.pid)
-    }
-
-    fn resolved_device_class(&self, ctaphid_enabled: bool, ccid_enabled: bool) -> DeviceClass {
-        self.device_class
-            .unwrap_or_else(|| infer_device_class(ctaphid_enabled, ccid_enabled))
-    }
-}
-
-pub trait Apps<'interrupt, D: Dispatch> {
-    type Data;
-
-    fn new(
-        service: &mut Service<Platform, D>,
-        endpoints: &mut Vec<ServiceEndpoint<'static, D::BackendId, D::Context>>,
-        syscall: Syscall,
-        data: Self::Data,
-    ) -> Self;
-
+pub struct UsbIpTransport<'bus, 'pipe, 'interrupt> {
+    usb_device: &'bus mut UsbDevice<'bus, UsbIpBus>,
     #[cfg(feature = "ctaphid")]
-    fn with_ctaphid_apps<T, const N: usize>(
-        &mut self,
-        f: impl FnOnce(&mut [&mut dyn ctaphid_dispatch::app::App<'interrupt, N>]) -> T,
-    ) -> T;
-
+    ctaphid: &'bus mut CtapHid<'bus, 'pipe, 'interrupt, UsbIpBus, { DEFAULT_MESSAGE_SIZE }>,
+    #[cfg(feature = "ctaphid")]
+    ctaphid_dispatch: ctaphid_dispatch::Dispatch<'pipe, 'interrupt, { DEFAULT_MESSAGE_SIZE }>,
     #[cfg(feature = "ccid")]
-    fn with_ccid_apps<T, const N: usize>(
-        &mut self,
-        f: impl FnOnce(&mut [&mut dyn apdu_dispatch::app::App<N>]) -> T,
-    ) -> T;
+    ccid: &'bus mut Ccid<'bus, 'pipe, UsbIpBus, 3072>,
+    #[cfg(feature = "ccid")]
+    apdu_dispatch: apdu_dispatch::dispatch::ApduDispatch<'pipe>,
+    epoch: Instant,
+    #[cfg(feature = "ctaphid")]
+    timeout_ctaphid: Timeout,
+    #[cfg(feature = "ccid")]
+    timeout_ccid: Timeout,
 }
 
-// virt::Store uses non-static references.  To be able to use the usbip runner with apps that
-// require direct access to the store, e. g. provisioner-app, we use a custom store implementation
-// with static lifetimes here.
-#[derive(Copy, Clone)]
-pub struct Store {
-    pub ifs: &'static dyn DynFilesystem,
-    pub efs: &'static dyn DynFilesystem,
-    pub vfs: &'static dyn DynFilesystem,
-}
-
-impl store::Store for Store {
-    fn ifs(&self) -> &'static dyn DynFilesystem {
-        self.ifs
-    }
-
-    fn efs(&self) -> &'static dyn DynFilesystem {
-        self.efs
-    }
-
-    fn vfs(&self) -> &'static dyn DynFilesystem {
-        self.vfs
-    }
-}
-
-pub struct Platform {
-    rng: ChaCha8Rng,
-    store: Store,
-    ui: UserInterface,
-}
-
-impl Platform {
-    pub fn new(store: Store) -> Self {
+impl<'bus, 'pipe, 'interrupt> UsbIpTransport<'bus, 'pipe, 'interrupt> {
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(
+        usb_device: &'bus mut UsbDevice<'bus, UsbIpBus>,
+        #[cfg(feature = "ctaphid")] ctaphid: &'bus mut CtapHid<
+            'bus,
+            'pipe,
+            'interrupt,
+            UsbIpBus,
+            { DEFAULT_MESSAGE_SIZE },
+        >,
+        #[cfg(feature = "ctaphid")] ctaphid_dispatch: ctaphid_dispatch::Dispatch<
+            'pipe,
+            'interrupt,
+            { DEFAULT_MESSAGE_SIZE },
+        >,
+        #[cfg(feature = "ccid")] ccid: &'bus mut Ccid<'bus, 'pipe, UsbIpBus, 3072>,
+        #[cfg(feature = "ccid")] apdu_dispatch: apdu_dispatch::dispatch::ApduDispatch<'pipe>,
+    ) -> Self {
         Self {
-            store,
-            rng: ChaCha8Rng::from_entropy(),
-            ui: UserInterface::new(),
+            usb_device,
+            #[cfg(feature = "ctaphid")]
+            ctaphid,
+            #[cfg(feature = "ctaphid")]
+            ctaphid_dispatch,
+            #[cfg(feature = "ccid")]
+            ccid,
+            #[cfg(feature = "ccid")]
+            apdu_dispatch,
+            epoch: Instant::now(),
+            #[cfg(feature = "ctaphid")]
+            timeout_ctaphid: Timeout::new(),
+            #[cfg(feature = "ccid")]
+            timeout_ccid: Timeout::new(),
         }
     }
 }
 
-impl platform::Platform for Platform {
-    type R = ChaCha8Rng;
-    type S = Store;
-    type UI = UserInterface;
-
-    fn user_interface(&mut self) -> &mut Self::UI {
-        &mut self.ui
-    }
-
-    fn rng(&mut self) -> &mut Self::R {
-        &mut self.rng
-    }
-
-    fn store(&self) -> Self::S {
-        self.store
-    }
-}
-
-pub struct Runner<D, A> {
-    options: Options,
-    dispatch: D,
-    _marker: PhantomData<A>,
-}
-
-impl<'interrupt, D: Dispatch, A: Apps<'interrupt, D>> Runner<D, A>
+impl<'interrupt, D> Transport<'interrupt, D> for UsbIpTransport<'_, '_, 'interrupt>
 where
+    D: Dispatch,
+{
+    fn poll<A: Apps<'interrupt, D>>(&mut self, apps: &mut A) -> io::Result<bool> {
+        let mut handled_usb_event = false;
+        while self.usb_device.poll(&mut [
+            #[cfg(feature = "ctaphid")]
+            &mut *self.ctaphid,
+            #[cfg(feature = "ccid")]
+            &mut *self.ccid,
+        ]) {
+            handled_usb_event = true;
+        }
+
+        let mut dispatched = false;
+
+        #[cfg(feature = "ctaphid")]
+        {
+            let ctaphid_did_work = apps.with_ctaphid_apps(|apps| {
+                let mut did_work = false;
+                while self.ctaphid_dispatch.poll(apps) {
+                    did_work = true;
+                }
+                did_work
+            });
+            dispatched |= ctaphid_did_work;
+        }
+
+        #[cfg(feature = "ccid")]
+        {
+            let ccid_did_work = apps.with_ccid_apps(|apps| {
+                let mut did_work = false;
+                while self.apdu_dispatch.poll(apps).is_some() {
+                    did_work = true;
+                }
+                did_work
+            });
+            dispatched |= ccid_did_work;
+        }
+
+        Ok(handled_usb_event || dispatched)
+    }
+
+    fn send(&mut self, waiting_for_user: bool) -> io::Result<bool> {
+        let mut keepalive_sent = false;
+
+        #[cfg(feature = "ctaphid")]
+        {
+            keepalive_sent |= ctaphid::keepalive(
+                self.ctaphid,
+                &mut self.timeout_ctaphid,
+                self.epoch,
+                waiting_for_user,
+            );
+        }
+
+        #[cfg(feature = "ccid")]
+        {
+            keepalive_sent |= ccid::keepalive(self.ccid, &mut self.timeout_ccid, self.epoch);
+        }
+
+        Ok(keepalive_sent)
+    }
+
+    fn wait(&mut self) -> io::Result<()> {
+        thread::yield_now();
+        Ok(())
+    }
+}
+
+pub fn exec<'interrupt, D, A>(
+    runner: Runner<D, A>,
+    platform: Platform,
+    data: A::Data,
+) -> io::Result<()>
+where
+    D: Dispatch,
     D::BackendId: Send + Sync,
     D::Context: Send + Sync,
+    A: Apps<'interrupt, D>,
 {
-    pub fn builder(options: Options) -> Builder {
-        Builder::new(options)
-    }
+    let usbip_bus = UsbIpBus::new();
+    usbip_bus.set_device_speed(2);
+    let bus_allocator = UsbBusAllocator::new(usbip_bus);
 
-    pub fn exec(self, platform: Platform, data: A::Data) {
-        // To change IP or port see usbip-device-0.1.4/src/handler.rs:26
-        let usbip_bus = UsbIpBus::new();
-        usbip_bus.set_device_speed(2);
-        let bus_allocator = UsbBusAllocator::new(usbip_bus);
+    #[cfg(feature = "ctaphid")]
+    let ctap_channel: Channel<{ DEFAULT_MESSAGE_SIZE }> = Channel::new();
+    #[cfg(feature = "ctaphid")]
+    let (mut ctaphid, ctaphid_dispatch) =
+        ctaphid::setup::<_, { DEFAULT_MESSAGE_SIZE }>(&bus_allocator, &ctap_channel);
 
+    #[cfg(feature = "ccid")]
+    let (contact, contactless) = Default::default();
+    #[cfg(feature = "ccid")]
+    let (mut ccid, apdu_dispatch) = ccid::setup(&bus_allocator, &contact, &contactless);
+
+    let device_options = runner.options().clone();
+    let mut usb_device = build_device(&bus_allocator, &device_options);
+
+    let transport = UsbIpTransport::new(
+        &mut usb_device,
         #[cfg(feature = "ctaphid")]
-        let ctap_channel = ctaphid_dispatch::Channel::new();
+        &mut ctaphid,
         #[cfg(feature = "ctaphid")]
-        let (mut ctaphid, mut ctaphid_dispatch) = ctaphid::setup::<
-            _,
-            { ctaphid_dispatch::DEFAULT_MESSAGE_SIZE },
-        >(&bus_allocator, &ctap_channel);
-
+        ctaphid_dispatch,
         #[cfg(feature = "ccid")]
-        let (contact, contactless) = Default::default();
+        &mut ccid,
         #[cfg(feature = "ccid")]
-        let (mut ccid, mut apdu_dispatch) = ccid::setup(&bus_allocator, &contact, &contactless);
+        apdu_dispatch,
+    );
 
-        let mut usb_device = build_device(&bus_allocator, &self.options);
-        let mut service = Service::with_dispatch(platform, self.dispatch);
-        let mut endpoints = Vec::new();
-        let (syscall_sender, syscall_receiver) = mpsc::channel();
-        let syscall = Syscall(syscall_sender);
-        let mut apps = A::new(&mut service, &mut endpoints, syscall, data);
-
-        log::info!("Ready for work");
-        thread::scope(|s| {
-            // usb poll + keepalive task
-            s.spawn(move || {
-                let _epoch = Instant::now();
-                #[cfg(feature = "ctaphid")]
-                let mut timeout_ctaphid = Timeout::new();
-                #[cfg(feature = "ccid")]
-                let mut timeout_ccid = Timeout::new();
-
-                loop {
-                    let mut handled_usb_event = false;
-                    while usb_device.poll(&mut [
-                        #[cfg(feature = "ctaphid")]
-                        &mut ctaphid,
-                        #[cfg(feature = "ccid")]
-                        &mut ccid,
-                    ]) {
-                        handled_usb_event = true;
-                    }
-
-                    #[cfg(feature = "ctaphid")]
-                    ctaphid::keepalive(&mut ctaphid, &mut timeout_ctaphid, _epoch);
-                    #[cfg(feature = "ccid")]
-                    ccid::keepalive(&mut ccid, &mut timeout_ccid, _epoch);
-
-                    // USB/IP adds host-side latency. Yield instead of sleeping so control
-                    // transfers can complete with minimal turnaround time.
-                    if !handled_usb_event {
-                        thread::yield_now();
-                    }
-                }
-            });
-
-            // trussed task
-            s.spawn(move || {
-                for _ in syscall_receiver.iter() {
-                    service.process(&mut endpoints)
-                }
-            });
-
-            // apps task
-            loop {
-                let mut dispatched = false;
-
-                #[cfg(feature = "ctaphid")]
-                {
-                    let ctaphid_did_work = apps.with_ctaphid_apps(|apps| {
-                        let mut did_work = false;
-                        while ctaphid_dispatch.poll(apps) {
-                            did_work = true;
-                        }
-                        did_work
-                    });
-                    dispatched |= ctaphid_did_work;
-                }
-
-                #[cfg(feature = "ccid")]
-                {
-                    let ccid_did_work = apps.with_ccid_apps(|apps| {
-                        let mut did_work = false;
-                        while apdu_dispatch.poll(apps).is_some() {
-                            did_work = true;
-                        }
-                        did_work
-                    });
-                    dispatched |= ccid_did_work;
-                }
-
-                if !dispatched {
-                    thread::yield_now();
-                }
-            }
-        });
-    }
+    runner.exec(platform, data, transport)
 }
 
-pub struct Builder<D = CoreOnly> {
-    options: Options,
-    dispatch: D,
-}
-
-impl Builder {
-    pub fn new(options: Options) -> Self {
-        Self {
-            options,
-            dispatch: Default::default(),
-        }
-    }
-}
-
-impl<D> Builder<D> {
-    pub fn dispatch<E>(self, dispatch: E) -> Builder<E> {
-        Builder {
-            options: self.options,
-            dispatch,
-        }
-    }
-}
-
-impl<D: Dispatch> Builder<D> {
-    pub fn build<'interrupt, A: Apps<'interrupt, D>>(self) -> Runner<D, A> {
-        Runner {
-            options: self.options,
-            dispatch: self.dispatch,
-            _marker: Default::default(),
-        }
-    }
-}
-
-#[derive(Clone)]
-pub struct Syscall(Sender<()>);
-
-impl trussed::client::Syscall for Syscall {
-    fn syscall(&mut self) {
-        log::debug!("syscall");
-        self.0.send(()).ok();
-    }
-}
-
-fn build_device<'a, B: UsbBus>(
-    bus_allocator: &'a UsbBusAllocator<B>,
+fn build_device<'a>(
+    bus_allocator: &'a UsbBusAllocator<UsbIpBus>,
     options: &'a Options,
-) -> UsbDevice<'a, B> {
-    let mut usb_builder = UsbDeviceBuilder::new(bus_allocator, options.vid_pid());
+) -> UsbDevice<'a, UsbIpBus> {
+    let mut usb_builder = UsbDeviceBuilder::new(bus_allocator, UsbVidPid(options.vid, options.pid));
     if let Some(manufacturer) = &options.manufacturer {
         usb_builder = usb_builder.manufacturer(manufacturer);
     }
@@ -365,40 +231,4 @@ fn build_device<'a, B: UsbBus>(
         .device_sub_class(device_class.sub_class)
         .device_protocol(device_class.protocol)
         .build()
-}
-
-fn infer_device_class(ctaphid_enabled: bool, ccid_enabled: bool) -> DeviceClass {
-    let interface_count = ctaphid_enabled as u8 + ccid_enabled as u8;
-
-    if ctaphid_enabled && interface_count == 1 {
-        DeviceClass::hid()
-    } else if interface_count > 1 {
-        DeviceClass::composite()
-    } else {
-        DeviceClass::per_interface()
-    }
-}
-
-#[derive(Default)]
-pub struct Timeout(Option<Duration>);
-
-impl Timeout {
-    fn new() -> Self {
-        Self::default()
-    }
-
-    fn update<F: FnOnce() -> Option<Duration>>(
-        &mut self,
-        epoch: Instant,
-        keepalive: Option<Duration>,
-        f: F,
-    ) {
-        if let Some(timeout) = self.0 {
-            if epoch.elapsed() >= timeout {
-                self.0 = f().map(|duration| epoch.elapsed() + duration);
-            }
-        } else if let Some(duration) = keepalive {
-            self.0 = Some(epoch.elapsed() + duration);
-        }
-    }
 }

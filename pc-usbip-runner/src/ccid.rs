@@ -5,7 +5,7 @@ use apdu_dispatch::interchanges::Data;
 use usb_device::bus::{UsbBus, UsbBusAllocator};
 use usbd_ccid::{Ccid, Status};
 
-use super::Timeout;
+use transport_core::Timeout;
 
 pub fn setup<'bus, 'pipe, B: UsbBus>(
     bus_allocator: &'bus UsbBusAllocator<B>,
@@ -22,10 +22,10 @@ pub fn keepalive<B: UsbBus, const N: usize>(
     ccid: &mut Ccid<'_, '_, B, N>,
     timeout: &mut Timeout,
     epoch: Instant,
-) {
+) -> bool {
     timeout.update(epoch, map_status(ccid.did_start_processing()), || {
         map_status(ccid.send_wait_extension())
-    });
+    })
 }
 
 fn map_status(status: Status) -> Option<Duration> {

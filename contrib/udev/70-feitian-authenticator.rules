@@ -1,0 +1,3 @@
+# Restrict access to the Feitian ML-DSA software authenticator hidraw node
+# Adjust GROUP to match your local FIDO access group if different from plugdev
+KERNEL=="hidraw*", ATTRS{idVendor}=="096e", ATTRS{idProduct}=="0858", MODE="0660", GROUP="plugdev"

@@ -1,3 +1,5 @@
+#![cfg(feature = "legacy")]
+
 //! USB/IP runner that exposes the ML-DSA authenticator over CTAPHID.
 //!
 //! The example wires the authenticator's CTAP application into the
@@ -9,11 +11,8 @@ use std::path::PathBuf;
 use authenticator::ctap::CtapApp;
 use clap::Parser;
 use clap_num::maybe_hex;
-use littlefs2::{
-    const_ram_storage,
-    fs::{Allocation, Filesystem},
-};
-use littlefs2_core::{path, DynFilesystem};
+use littlefs2_core::path;
+use transport_core::state::{default_state_dir, IdentityConfig, PersistentStore};
 use trussed::{
     backend::{CoreOnly, NoId},
     client::Client,
@@ -21,7 +20,7 @@ use trussed::{
     service::Service,
     types::{CoreContext, NoData},
 };
-use trussed_usbip::{Platform, Store, Syscall};
+use trussed_usbip::{exec, set_waiting, Builder, Client, Platform, Syscall};
 
 #[derive(Parser, Debug)]
 #[clap(about, version, author)]
@@ -42,9 +41,9 @@ struct Args {
     #[clap(long, default_value = "FEITIAN-PQC-001")]
     serial: String,
 
-    /// Trussed state file (currently unused, reserved for future persistence)
-    #[clap(long, default_value = "trussed-state.bin")]
-    state_file: PathBuf,
+    /// Directory where persistent Trussed state will be stored
+    #[clap(long, value_parser, default_value_os_t = default_state_dir())]
+    state_dir: PathBuf,
 
     /// USB VID
     #[clap(short, long, parse(try_from_str = maybe_hex), default_value_t = 0x1998)]
@@ -73,7 +72,7 @@ struct Apps<C: Client> {
     ctap: CtapApp<C>,
 }
 
-impl<'a> trussed_usbip::Apps<'a, CoreOnly> for Apps<trussed_usbip::Client<CoreOnly>> {
+impl<'a> trussed_usbip::Apps<'a, CoreOnly> for Apps<Client<CoreOnly>> {
     type Data = AppData;
 
     fn new(
@@ -86,10 +85,10 @@ impl<'a> trussed_usbip::Apps<'a, CoreOnly> for Apps<trussed_usbip::Client<CoreOn
         let (requester, responder) = CHANNEL.split().expect("Trussed channel split");
         let context = CoreContext::new(path!("authenticator").into());
         endpoints.push(ServiceEndpoint::new(responder, context, &[]));
-        let client = trussed_usbip::Client::new(requester, syscall, None);
+        let client = Client::new(requester, syscall, None);
         let mut ctap = CtapApp::new(client, data.aaguid);
         ctap.set_auto_user_presence(data.auto_user_presence);
-        ctap.set_keepalive_callback(trussed_usbip::set_waiting);
+        ctap.set_keepalive_callback(set_waiting);
         Self { ctap }
     }
 
@@ -108,16 +107,6 @@ impl<'a> trussed_usbip::Apps<'a, CoreOnly> for Apps<trussed_usbip::Client<CoreOn
     ) -> T {
         f(&mut [])
     }
-}
-
-const_ram_storage!(RamStorage, 512 * 128);
-
-fn ram_filesystem() -> &'static dyn DynFilesystem {
-    let storage = Box::leak(Box::new(RamStorage::new()));
-    Filesystem::format(storage).expect("failed to format RAM filesystem");
-    let alloc = Box::leak(Box::new(Allocation::new()));
-    let fs = Filesystem::mount(alloc, storage).expect("failed to mount RAM filesystem");
-    Box::leak(Box::new(fs))
 }
 
 fn parse_aaguid(input: &str) -> Result<[u8; 16], String> {
@@ -141,12 +130,17 @@ fn main() {
     let args = Args::parse();
     let aaguid = parse_aaguid(&args.aaguid).expect("invalid AAGUID");
 
-    // TODO: use filesystem storage for IFS
-    let store = Store {
-        ifs: ram_filesystem(),
-        efs: ram_filesystem(),
-        vfs: ram_filesystem(),
-    };
+    let mut persistent =
+        PersistentStore::new(&args.state_dir).expect("failed to open persistent store");
+    persistent
+        .initialize_identity(IdentityConfig {
+            aaguid,
+            manufacturer: &args.manufacturer,
+            product: &args.product,
+            serial: &args.serial,
+        })
+        .expect("failed to initialize persistent state");
+    let store = persistent.store();
     let options = trussed_usbip::Options {
         manufacturer: Some(args.manufacturer),
         product: Some(args.product),
@@ -158,15 +152,16 @@ fn main() {
 
     log::info!("Initializing Trussed");
     let platform = Platform::new(store);
-    trussed_usbip::Builder::new(options)
-        .build::<Apps<_>>()
-        .exec(
-            platform,
-            AppData {
-                aaguid,
-                auto_user_presence: !args.manual_user_presence,
-            },
-        );
+    let runner = Builder::new(options).build::<Apps<_>>();
+    exec(
+        runner,
+        platform,
+        AppData {
+            aaguid,
+            auto_user_presence: !args.manual_user_presence,
+        },
+    )
+    .expect("usbip transport exited");
 }
 
 #[cfg(test)]

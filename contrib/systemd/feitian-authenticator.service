@@ -1,0 +1,26 @@
+# Example systemd unit for running the Feitian ML-DSA authenticator as a
+# persistent service using the pc-hid-runner CLI.
+#
+# Copy to /etc/systemd/system/ and adjust the ExecStart line or CLI flags to
+# match your desired VID/PID, attestation policy, or user-presence behaviour.
+# Ensure the state directory exists with 0700 permissions and is owned by the
+# configured user before enabling the service:
+#   sudo install -d -m 700 -o feitian -g feitian /var/lib/feitian-mldsa-authenticator
+
+[Unit]
+Description=Feitian ML-DSA Authenticator (UHID)
+After=network.target local-fs.target
+
+[Service]
+Type=simple
+User=feitian
+Group=feitian
+WorkingDirectory=/var/lib/feitian-mldsa-authenticator
+Environment=RUST_LOG=info
+ExecStart=/usr/bin/pc-hid-runner authenticator start --foreground --state-dir=/var/lib/feitian-mldsa-authenticator
+ExecStop=/usr/bin/pc-hid-runner authenticator stop --state-dir=/var/lib/feitian-mldsa-authenticator
+Restart=on-failure
+RestartSec=5s
+
+[Install]
+WantedBy=multi-user.target
