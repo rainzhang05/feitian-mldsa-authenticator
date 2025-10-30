@@ -2,7 +2,6 @@ name: USBIP Authenticator Check
 
 on:
   push:
-    branches: [ main ]
   pull_request:
   workflow_dispatch:
 
