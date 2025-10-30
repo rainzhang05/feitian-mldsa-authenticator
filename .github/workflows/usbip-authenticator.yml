@@ -1,0 +1,112 @@
+name: USBIP Authenticator Check
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  usbip-authenticator:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    env:
+      RUST_LOG: debug
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Install usbip tooling
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y linux-tools-$(uname -r) linux-cloud-tools-$(uname -r)
+
+      - name: Start authenticator USB/IP server
+        run: |
+          set -euxo pipefail
+          cd pc-usbip-runner
+          nohup cargo run --release --example authenticator > "$GITHUB_WORKSPACE/authenticator.log" 2>&1 &
+          echo "AUTH_PID=$!" >> "$GITHUB_ENV"
+          sleep 10
+
+      - name: Load vhci-hcd kernel module
+        run: sudo modprobe vhci-hcd
+
+      - name: Discover USB/IP bus ID
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+import os
+import re
+import subprocess
+import sys
+import time
+from typing import Optional
+
+
+def find_bus_id(output: str) -> Optional[str]:
+    pattern = re.compile(r"^\s*-\s*([0-9]+-[0-9]+):.*Feitian", re.MULTILINE)
+    match = pattern.search(output)
+    if match:
+        return match.group(1)
+    return None
+
+for attempt in range(15):
+    try:
+        result = subprocess.run([
+            "usbip", "list", "-r", "localhost"
+        ], check=True, text=True, capture_output=True)
+        output = result.stdout
+    except subprocess.CalledProcessError as exc:
+        output = (exc.stdout or "") + (exc.stderr or "")
+    print(output)
+    bus_id = find_bus_id(output)
+    if bus_id:
+        print(f"Found bus ID: {bus_id}")
+        with open(os.environ["GITHUB_ENV"], "a", encoding="utf-8") as env_file:
+            env_file.write(f"BUS_ID={bus_id}\n")
+        sys.exit(0)
+    time.sleep(2)
+
+print("Failed to locate Feitian authenticator bus ID", file=sys.stderr)
+sys.exit(1)
+PY
+
+      - name: Attach USB/IP device
+        run: |
+          set -euxo pipefail
+          ATTACH_OUTPUT=$(sudo usbip attach -r localhost -b "$BUS_ID")
+          echo "$ATTACH_OUTPUT"
+          PORT=$(printf '%s' "$ATTACH_OUTPUT" | sed -n 's/.*vhci_hcd port \([0-9][0-9]*\).*/\1/p')
+          if [ -z "$PORT" ]; then
+            echo "Unable to parse attached port" >&2
+            exit 1
+          fi
+          echo "USBIP_PORT=$PORT" >> "$GITHUB_ENV"
+
+      - name: Verify attached ports
+        run: |
+          sudo usbip port
+          lsusb
+
+      - name: Upload authenticator logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: authenticator-log
+          path: ${{ github.workspace }}/authenticator.log
+
+      - name: Cleanup
+        if: always()
+        run: |
+          set +e
+          if [ -n "${USBIP_PORT:-}" ]; then
+            sudo usbip detach -p "$USBIP_PORT"
+          fi
+          if [ -n "${AUTH_PID:-}" ]; then
+            kill "$AUTH_PID" || true
+          fi
