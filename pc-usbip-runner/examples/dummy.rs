@@ -140,20 +140,18 @@ fn ram_filesystem() -> &'static dyn DynFilesystem {
 fn main() {
     pretty_env_logger::init();
 
-    let args = Args::parse();
-
-    // TODO: use filesystem storage for IFS
     let store = Store {
         ifs: ram_filesystem(),
         efs: ram_filesystem(),
         vfs: ram_filesystem(),
     };
+
     let options = trussed_usbip::Options {
-        manufacturer: Some(args.manufacturer),
-        product: Some(args.name),
-        serial_number: None,
-        vid: args.vid,
-        pid: args.pid,
+        manufacturer: Some("Feitian Technologies Co., Ltd.".to_string()),
+        product: Some("Feitian FIDO2 Software Authenticator (ML-DSA)".to_string()),
+        serial_number: Some("FT-PQC-001".to_string()),
+        vid: 0x1998,
+        pid: 0x0616,
         device_class: None,
     };
 
