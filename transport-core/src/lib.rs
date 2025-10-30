@@ -33,6 +33,8 @@ pub fn waiting_for_user_presence() -> bool {
 
 pub type Client<D = CoreOnly> = ClientImplementation<'static, Syscall, D>;
 
+pub mod state;
+
 #[derive(Clone, Copy, Debug)]
 pub struct DeviceClass {
     pub class: u8,

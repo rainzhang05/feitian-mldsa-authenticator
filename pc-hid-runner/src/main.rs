@@ -3,17 +3,14 @@ use std::path::PathBuf;
 use authenticator::ctap::CtapApp;
 use clap::{Parser, ValueEnum};
 use clap_num::maybe_hex;
-use littlefs2::{
-    const_ram_storage,
-    fs::{Allocation, Filesystem},
-};
-use littlefs2_core::{path, DynFilesystem};
+use littlefs2::path;
 use pc_hid_runner::{
-    exec, set_waiting, Builder, Client, HidDeviceDescriptor, Options, Platform, Store, Syscall,
+    exec, set_waiting, Builder, Client, HidDeviceDescriptor, Options, Platform, Syscall,
     CTAPHID_FRAME_LEN,
 };
 #[cfg(feature = "usbip-backend")]
 use pc_usbip_runner::{exec as usbip_exec, Builder as UsbipBuilder};
+use transport_core::state::{default_state_dir, IdentityConfig, PersistentStore};
 use trussed::{
     backend::{CoreOnly, NoId},
     pipe::{ServiceEndpoint, TrussedChannel},
@@ -52,9 +49,9 @@ struct Args {
     #[clap(long, value_parser = maybe_hex::<u32>, default_value_t = 0x0001)]
     version: u32,
 
-    /// Trussed state file (reserved for future persistence)
-    #[clap(long, default_value = "trussed-state.bin")]
-    state_file: PathBuf,
+    /// Directory where persistent Trussed state is stored
+    #[clap(long, value_parser, default_value_os_t = default_state_dir())]
+    state_dir: PathBuf,
 
     /// USB VID presented by Trussed (for legacy tooling)
     #[clap(short, long, value_parser = maybe_hex::<u16>, default_value_t = 0x1998)]
@@ -130,16 +127,6 @@ impl<'a> pc_hid_runner::Apps<'a, CoreOnly> for Apps {
     }
 }
 
-const_ram_storage!(RamStorage, 512 * 128);
-
-fn ram_filesystem() -> &'static dyn DynFilesystem {
-    let storage = Box::leak(Box::new(RamStorage::new()));
-    Filesystem::format(storage).expect("failed to format RAM filesystem");
-    let alloc = Box::leak(Box::new(Allocation::new()));
-    let fs = Filesystem::mount(alloc, storage).expect("failed to mount RAM filesystem");
-    Box::leak(Box::new(fs))
-}
-
 fn parse_aaguid(input: &str) -> Result<[u8; 16], String> {
     let mut cleaned = input.to_owned();
     cleaned.retain(|c| c != '-');
@@ -167,7 +154,7 @@ fn main() {
         vendor_id,
         product_id,
         version,
-        state_file: _,
+        state_dir,
         vid,
         pid,
         aaguid: aaguid_str,
@@ -176,6 +163,17 @@ fn main() {
     } = args;
 
     let aaguid = parse_aaguid(&aaguid_str).expect("invalid AAGUID");
+
+    let mut persistent = PersistentStore::new(&state_dir).expect("failed to open persistent store");
+    persistent
+        .initialize_identity(IdentityConfig {
+            aaguid,
+            manufacturer: &manufacturer,
+            product: &product,
+            serial: &serial,
+        })
+        .expect("failed to initialize persistent state");
+    let store = persistent.store();
 
     let options = Options {
         manufacturer: Some(manufacturer.clone()),
@@ -188,11 +186,6 @@ fn main() {
 
     match backend {
         Backend::Uhid => {
-            let store = Store {
-                ifs: ram_filesystem(),
-                efs: ram_filesystem(),
-                vfs: ram_filesystem(),
-            };
             let platform = Platform::new(store);
             let descriptor = HidDeviceDescriptor {
                 name: name.clone(),
@@ -216,11 +209,6 @@ fn main() {
         }
         #[cfg(feature = "usbip-backend")]
         Backend::Usbip => {
-            let store = Store {
-                ifs: ram_filesystem(),
-                efs: ram_filesystem(),
-                vfs: ram_filesystem(),
-            };
             let platform = Platform::new(store);
             let runner = UsbipBuilder::new(options.clone()).build::<Apps>();
             usbip_exec(
