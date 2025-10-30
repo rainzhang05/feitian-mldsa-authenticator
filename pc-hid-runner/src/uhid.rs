@@ -1,6 +1,7 @@
 use nix::errno::Errno;
 use nix::fcntl::{fcntl, FcntlArg, OFlag};
 use nix::libc;
+use nix::poll::{poll, PollFd, PollFlags};
 use nix::unistd::{read, write};
 use serde::{Deserialize, Serialize};
 use signal_hook::iterator::Signals;
@@ -11,7 +12,6 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::thread;
 use std::time::Duration;
-use tokio::io::unix::AsyncFd;
 
 const DEVICE_PATH: &str = "/dev/uhid";
 
@@ -113,140 +113,135 @@ impl UhidDevice {
         fcntl(fd, FcntlArg::F_SETFL(oflags)).map_err(to_io_error)?;
 
         let owned = unsafe { OwnedFd::from_raw_fd(file.into_raw_fd()) };
-        let async_fd = AsyncFd::new(owned)?;
-        let inner = Arc::new(UhidInner::new(async_fd));
+        let inner = Arc::new(UhidInner::new(owned));
 
         register_signal_handler(&inner)?;
 
         Ok(Self { inner, descriptor })
     }
 
-    pub async fn write_frame(&self, frame: &CtapHidFrame) -> io::Result<()> {
-        self.inner.send_input_report(frame.as_bytes()).await
-    }
-
-    pub async fn read_frame(&self) -> io::Result<CtapHidFrame> {
+    pub fn try_read_frame(&self) -> io::Result<Option<CtapHidFrame>> {
         loop {
-            let event = self.inner.read_event().await?;
-            match event.type_ {
-                raw::UHID_EVENT_TYPE_OUTPUT => {
-                    let size = unsafe { event.u.output.size } as usize;
-                    let rtype = unsafe { event.u.output.rtype };
-                    if !matches!(
-                        ReportType::from_raw(rtype),
-                        Some(ReportType::Output) | Some(ReportType::Feature)
-                    ) {
-                        continue;
-                    }
-                    if size == CTAPHID_FRAME_LEN {
-                        let mut data = [0u8; CTAPHID_FRAME_LEN];
-                        unsafe {
-                            data.copy_from_slice(&event.u.output.data[..CTAPHID_FRAME_LEN]);
+            match self.inner.try_read_event()? {
+                None => return Ok(None),
+                Some(event) => match event.type_ {
+                    raw::UHID_EVENT_TYPE_OUTPUT => {
+                        let size = unsafe { event.u.output.size } as usize;
+                        let rtype = unsafe { event.u.output.rtype };
+                        if !matches!(
+                            ReportType::from_raw(rtype),
+                            Some(ReportType::Output) | Some(ReportType::Feature)
+                        ) {
+                            continue;
                         }
-                        return Ok(CtapHidFrame::new(data));
-                    }
-                }
-                raw::UHID_EVENT_TYPE_SET_REPORT => {
-                    let size = unsafe { event.u.set_report.size } as usize;
-                    let id = unsafe { event.u.set_report.id };
-                    let rtype = unsafe { event.u.set_report.rtype };
-                    let status = if matches!(
-                        ReportType::from_raw(rtype),
-                        Some(ReportType::Output) | Some(ReportType::Feature)
-                    ) {
-                        0
-                    } else {
-                        Errno::EINVAL as u16
-                    };
-                    self.send_set_report_reply(id, status).await?;
-                    if status != 0 {
-                        continue;
-                    }
-                    if size == CTAPHID_FRAME_LEN {
-                        let mut data = [0u8; CTAPHID_FRAME_LEN];
-                        unsafe {
-                            data.copy_from_slice(&event.u.set_report.data[..CTAPHID_FRAME_LEN]);
+                        if size == CTAPHID_FRAME_LEN {
+                            let mut data = [0u8; CTAPHID_FRAME_LEN];
+                            unsafe {
+                                data.copy_from_slice(&event.u.output.data[..CTAPHID_FRAME_LEN]);
+                            }
+                            return Ok(Some(CtapHidFrame::new(data)));
                         }
-                        return Ok(CtapHidFrame::new(data));
                     }
-                }
-                raw::UHID_EVENT_TYPE_GET_REPORT => {
-                    let id = unsafe { event.u.get_report.id };
-                    let rtype = unsafe { event.u.get_report.rtype };
-                    if ReportType::from_raw(rtype) != Some(ReportType::Feature) {
-                        self.send_get_report_reply(id, Errno::EINVAL as u16, &[])
-                            .await?;
-                        continue;
+                    raw::UHID_EVENT_TYPE_SET_REPORT => {
+                        let size = unsafe { event.u.set_report.size } as usize;
+                        let id = unsafe { event.u.set_report.id };
+                        let rtype = unsafe { event.u.set_report.rtype };
+                        let status = if matches!(
+                            ReportType::from_raw(rtype),
+                            Some(ReportType::Output) | Some(ReportType::Feature)
+                        ) {
+                            0
+                        } else {
+                            Errno::EINVAL as u16
+                        };
+                        self.inner.send_set_report_reply(id, status)?;
+                        if status != 0 {
+                            continue;
+                        }
+                        if size == CTAPHID_FRAME_LEN {
+                            let mut data = [0u8; CTAPHID_FRAME_LEN];
+                            unsafe {
+                                data.copy_from_slice(&event.u.set_report.data[..CTAPHID_FRAME_LEN]);
+                            }
+                            return Ok(Some(CtapHidFrame::new(data)));
+                        }
                     }
-                    self.send_get_report_reply(id, 0, &self.descriptor.feature_report)
-                        .await?;
-                }
-                raw::UHID_EVENT_TYPE_START
-                | raw::UHID_EVENT_TYPE_STOP
-                | raw::UHID_EVENT_TYPE_OPEN
-                | raw::UHID_EVENT_TYPE_CLOSE => {
-                    // Nothing to do for lifecycle events.
-                }
-                _ => {}
+                    raw::UHID_EVENT_TYPE_GET_REPORT => {
+                        let id = unsafe { event.u.get_report.id };
+                        let rtype = unsafe { event.u.get_report.rtype };
+                        if ReportType::from_raw(rtype) != Some(ReportType::Feature) {
+                            self.inner
+                                .send_get_report_reply(id, Errno::EINVAL as u16, &[])?;
+                            continue;
+                        }
+                        self.inner
+                            .send_get_report_reply(id, 0, &self.descriptor.feature_report)?;
+                    }
+                    raw::UHID_EVENT_TYPE_START
+                    | raw::UHID_EVENT_TYPE_STOP
+                    | raw::UHID_EVENT_TYPE_OPEN
+                    | raw::UHID_EVENT_TYPE_CLOSE => {}
+                    _ => {}
+                },
             }
         }
     }
 
-    pub async fn send_get_report_reply(&self, id: u32, err: u16, data: &[u8]) -> io::Result<()> {
-        self.inner.send_get_report_reply(id, err, data).await
+    pub fn write_frame(&self, frame: &CtapHidFrame) -> io::Result<()> {
+        self.inner.send_input_report(frame.as_bytes())
     }
 
-    pub async fn send_set_report_reply(&self, id: u32, err: u16) -> io::Result<()> {
-        self.inner.send_set_report_reply(id, err).await
+    pub fn wait(&self, timeout: Option<Duration>) -> io::Result<bool> {
+        self.inner.wait(timeout)
     }
 }
 
 struct UhidInner {
-    fd: AsyncFd<OwnedFd>,
+    fd: OwnedFd,
     destroyed: AtomicBool,
 }
 
 impl UhidInner {
-    fn new(fd: AsyncFd<OwnedFd>) -> Self {
+    fn new(fd: OwnedFd) -> Self {
         Self {
             fd,
             destroyed: AtomicBool::new(false),
         }
     }
 
-    async fn read_event(&self) -> io::Result<raw::uhid_event> {
+    fn try_read_event(&self) -> io::Result<Option<raw::uhid_event>> {
+        match read_event_nonblocking(self.fd.as_raw_fd()) {
+            Ok(event) => Ok(Some(event)),
+            Err(err) if err.kind() == io::ErrorKind::WouldBlock => Ok(None),
+            Err(err) => Err(err),
+        }
+    }
+
+    fn wait(&self, timeout: Option<Duration>) -> io::Result<bool> {
+        let mut fds = [PollFd::new(&self.fd, PollFlags::POLLIN)];
+        let timeout_ms = timeout
+            .map(|d| d.as_millis().min(i32::MAX as u128) as i32)
+            .unwrap_or(-1);
         loop {
-            let mut guard = self.fd.readable().await?;
-            match guard.try_io(|fd| read_event_nonblocking(fd.as_raw_fd())) {
-                Ok(Ok(event)) => return Ok(event),
-                Ok(Err(err)) => return Err(err),
-                Err(_would_block) => continue,
+            match poll(&mut fds, timeout_ms) {
+                Ok(ready) => return Ok(ready > 0),
+                Err(Errno::EINTR) => continue,
+                Err(err) => return Err(to_io_error(err.into())),
             }
         }
     }
 
-    async fn write_event(&self, event: &raw::uhid_event) -> io::Result<()> {
-        loop {
-            let mut guard = self.fd.writable().await?;
-            match guard.try_io(|fd| write_event_nonblocking(fd.as_raw_fd(), event)) {
-                Ok(Ok(())) => return Ok(()),
-                Ok(Err(err)) => return Err(err),
-                Err(_would_block) => continue,
-            }
-        }
-    }
-
-    async fn send_input_report(&self, data: &[u8; CTAPHID_FRAME_LEN]) -> io::Result<()> {
+    fn send_input_report(&self, data: &[u8; CTAPHID_FRAME_LEN]) -> io::Result<()> {
         let mut event = raw::uhid_event::default();
         event.type_ = raw::UHID_EVENT_TYPE_INPUT2;
         event.u.input2.size = CTAPHID_FRAME_LEN as u16;
         unsafe {
             event.u.input2.data[..CTAPHID_FRAME_LEN].copy_from_slice(data);
         }
-        self.write_event(&event).await
+        write_event_blocking(self.fd.as_raw_fd(), &event)
     }
 
-    async fn send_get_report_reply(&self, id: u32, err: u16, data: &[u8]) -> io::Result<()> {
+    fn send_get_report_reply(&self, id: u32, err: u16, data: &[u8]) -> io::Result<()> {
         if data.len() > raw::UHID_DATA_MAX {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
@@ -261,15 +256,15 @@ impl UhidInner {
         unsafe {
             event.u.get_report_reply.data[..data.len()].copy_from_slice(data);
         }
-        self.write_event(&event).await
+        write_event_blocking(self.fd.as_raw_fd(), &event)
     }
 
-    async fn send_set_report_reply(&self, id: u32, err: u16) -> io::Result<()> {
+    fn send_set_report_reply(&self, id: u32, err: u16) -> io::Result<()> {
         let mut event = raw::uhid_event::default();
         event.type_ = raw::UHID_EVENT_TYPE_SET_REPORT_REPLY;
         event.u.set_report_reply.id = id;
         event.u.set_report_reply.err = err;
-        self.write_event(&event).await
+        write_event_blocking(self.fd.as_raw_fd(), &event)
     }
 
     fn destroy_blocking(&self) -> io::Result<()> {
@@ -278,7 +273,7 @@ impl UhidInner {
         }
         let mut event = raw::uhid_event::default();
         event.type_ = raw::UHID_EVENT_TYPE_DESTROY;
-        write_event_blocking(self.fd.get_ref().as_raw_fd(), &event)
+        write_event_blocking(self.fd.as_raw_fd(), &event)
     }
 }
 
@@ -345,21 +340,6 @@ fn write_event_blocking(fd: RawFd, event: &raw::uhid_event) -> io::Result<()> {
             Err(err) => return Err(to_io_error(err.into())),
         }
     }
-}
-
-fn write_event_nonblocking(fd: RawFd, event: &raw::uhid_event) -> io::Result<()> {
-    let mut offset = 0;
-    let bytes = event_as_bytes(event);
-    while offset < bytes.len() {
-        match write(fd, &bytes[offset..]) {
-            Ok(0) => return Err(io::Error::new(io::ErrorKind::WriteZero, "write zero")),
-            Ok(n) => offset += n,
-            Err(Errno::EINTR) => continue,
-            Err(Errno::EAGAIN) => return Err(io::ErrorKind::WouldBlock.into()),
-            Err(err) => return Err(to_io_error(err.into())),
-        }
-    }
-    Ok(())
 }
 
 fn read_event_nonblocking(fd: RawFd) -> io::Result<raw::uhid_event> {

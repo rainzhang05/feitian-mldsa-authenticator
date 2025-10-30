@@ -1,23 +1,12 @@
-use std::{
-    collections::VecDeque,
-    convert::TryInto,
-    io,
-    sync::{
-        atomic::{AtomicBool, Ordering},
-        Arc,
-    },
-    time::{Duration, Instant},
-};
+use std::{collections::VecDeque, convert::TryInto};
 
+use crate::uhid::{CtapHidFrame, CTAPHID_FRAME_LEN};
 use ctaphid_dispatch::{
     app::{App, Command, Error as AppError},
     Requester,
 };
 use heapless_bytes::Bytes;
 use interchange::State as InterchangeState;
-use tokio::time::{interval, MissedTickBehavior};
-
-use crate::uhid::{CtapHidFrame, UhidDevice, CTAPHID_FRAME_LEN};
 
 const PACKET_SIZE: usize = CTAPHID_FRAME_LEN;
 
@@ -299,8 +288,11 @@ impl<'pipe, const N: usize> CtaphidHost<'pipe, N> {
         &mut self,
         dispatch: &mut ctaphid_dispatch::Dispatch<'pipe, 'interrupt, N>,
         apps: &mut [&mut dyn App<'interrupt, N>],
-    ) {
-        let _ = dispatch.poll(apps);
+    ) -> bool {
+        let mut did_work = false;
+        while dispatch.poll(apps) {
+            did_work = true;
+        }
 
         if let State::WaitingOnAuthenticator { request } = self.state {
             if let Ok(response) = self.requester.response() {
@@ -319,9 +311,11 @@ impl<'pipe, const N: usize> CtaphidHost<'pipe, N> {
                         Ok(len) => {
                             let response = Response::from_request_and_size(request, len);
                             self.enqueue_response(response);
+                            did_work = true;
                         }
                         Err(error) => {
                             self.start_sending_error(request, error);
+                            did_work = true;
                         }
                     }
                 }
@@ -330,6 +324,8 @@ impl<'pipe, const N: usize> CtaphidHost<'pipe, N> {
                 self.needs_keepalive = false;
             }
         }
+
+        did_work
     }
 
     pub fn has_pending_frames(&self) -> bool {
@@ -496,50 +492,6 @@ impl<'pipe, const N: usize> CtaphidHost<'pipe, N> {
     }
 }
 
-pub async fn run_ctaphid_loop<'pipe, 'interrupt, const N: usize>(
-    device: UhidDevice,
-    mut host: CtaphidHost<'pipe, N>,
-    mut dispatch: ctaphid_dispatch::Dispatch<'pipe, 'interrupt, N>,
-    apps: &mut [&mut dyn App<'interrupt, N>],
-    waiting_for_user: Arc<AtomicBool>,
-) -> io::Result<()> {
-    let start = Instant::now();
-    let mut keepalive_timer = interval(Duration::from_millis(50));
-    keepalive_timer.set_missed_tick_behavior(MissedTickBehavior::Delay);
-
-    loop {
-        tokio::select! {
-            frame = device.read_frame() => {
-                let frame = frame?;
-                let elapsed = start.elapsed().as_millis() as u64;
-                host.handle_frame(&frame, elapsed);
-                host.poll_dispatch(&mut dispatch, apps);
-                flush_pending(&device, &mut host).await?;
-            }
-            _ = keepalive_timer.tick() => {
-                let elapsed = start.elapsed().as_millis() as u64;
-                host.handle_timeout(elapsed);
-                let waiting = waiting_for_user.load(Ordering::Relaxed);
-                if host.send_keepalive(waiting) {
-                    flush_pending(&device, &mut host).await?;
-                }
-                host.poll_dispatch(&mut dispatch, apps);
-                flush_pending(&device, &mut host).await?;
-            }
-        }
-    }
-}
-
-async fn flush_pending<'pipe, const N: usize>(
-    device: &UhidDevice,
-    host: &mut CtaphidHost<'pipe, N>,
-) -> io::Result<()> {
-    while let Some(frame) = host.next_outgoing_frame() {
-        device.write_frame(&frame).await?;
-    }
-    Ok(())
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -593,7 +545,7 @@ mod tests {
         init_packet[7..15].copy_from_slice(&[1, 2, 3, 4, 5, 6, 7, 8]);
         host.handle_frame(&CtapHidFrame::new(init_packet), 0);
         let mut apps: [&mut dyn App<'static, DEFAULT_MESSAGE_SIZE>; 1] = [&mut app];
-        host.poll_dispatch(&mut dispatch, &mut apps);
+        let _ = host.poll_dispatch(&mut dispatch, &mut apps);
 
         let frames = take_frame_bytes(&mut host);
         assert_eq!(frames.len(), 1);
@@ -625,7 +577,7 @@ mod tests {
         host.handle_frame(&CtapHidFrame::new(cont_packet), 1);
 
         let mut apps: [&mut dyn App<'static, DEFAULT_MESSAGE_SIZE>; 1] = [&mut app];
-        host.poll_dispatch(&mut dispatch, &mut apps);
+        let _ = host.poll_dispatch(&mut dispatch, &mut apps);
 
         // apps echo payload, so expect two frames (init + continuation)
         let frames = take_frame_bytes(&mut host);
@@ -646,7 +598,7 @@ mod tests {
 
         host.handle_timeout(600);
         let mut apps: [&mut dyn App<'static, DEFAULT_MESSAGE_SIZE>; 1] = [&mut app];
-        host.poll_dispatch(&mut dispatch, &mut apps);
+        let _ = host.poll_dispatch(&mut dispatch, &mut apps);
 
         let frames = take_frame_bytes(&mut host);
         assert_eq!(frames.len(), 1);
@@ -671,7 +623,7 @@ mod tests {
         host.handle_frame(&CtapHidFrame::new(cancel_packet), 1);
 
         let mut apps: [&mut dyn App<'static, DEFAULT_MESSAGE_SIZE>; 1] = [&mut app];
-        host.poll_dispatch(&mut dispatch, &mut apps);
+        let _ = host.poll_dispatch(&mut dispatch, &mut apps);
         let frames = take_frame_bytes(&mut host);
         assert_eq!(frames.len(), 1);
         assert_eq!(frames[0][7], u8::from(AuthenticatorError::Canceled));

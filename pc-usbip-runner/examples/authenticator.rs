@@ -1,3 +1,5 @@
+#![cfg(feature = "legacy")]
+
 //! USB/IP runner that exposes the ML-DSA authenticator over CTAPHID.
 //!
 //! The example wires the authenticator's CTAP application into the
@@ -21,7 +23,7 @@ use trussed::{
     service::Service,
     types::{CoreContext, NoData},
 };
-use trussed_usbip::{Platform, Store, Syscall};
+use trussed_usbip::{exec, set_waiting, Builder, Client, Platform, Store, Syscall};
 
 #[derive(Parser, Debug)]
 #[clap(about, version, author)]
@@ -73,7 +75,7 @@ struct Apps<C: Client> {
     ctap: CtapApp<C>,
 }
 
-impl<'a> trussed_usbip::Apps<'a, CoreOnly> for Apps<trussed_usbip::Client<CoreOnly>> {
+impl<'a> trussed_usbip::Apps<'a, CoreOnly> for Apps<Client<CoreOnly>> {
     type Data = AppData;
 
     fn new(
@@ -86,10 +88,10 @@ impl<'a> trussed_usbip::Apps<'a, CoreOnly> for Apps<trussed_usbip::Client<CoreOn
         let (requester, responder) = CHANNEL.split().expect("Trussed channel split");
         let context = CoreContext::new(path!("authenticator").into());
         endpoints.push(ServiceEndpoint::new(responder, context, &[]));
-        let client = trussed_usbip::Client::new(requester, syscall, None);
+        let client = Client::new(requester, syscall, None);
         let mut ctap = CtapApp::new(client, data.aaguid);
         ctap.set_auto_user_presence(data.auto_user_presence);
-        ctap.set_keepalive_callback(trussed_usbip::set_waiting);
+        ctap.set_keepalive_callback(set_waiting);
         Self { ctap }
     }
 
@@ -158,15 +160,16 @@ fn main() {
 
     log::info!("Initializing Trussed");
     let platform = Platform::new(store);
-    trussed_usbip::Builder::new(options)
-        .build::<Apps<_>>()
-        .exec(
-            platform,
-            AppData {
-                aaguid,
-                auto_user_presence: !args.manual_user_presence,
-            },
-        );
+    let runner = Builder::new(options).build::<Apps<_>>();
+    exec(
+        runner,
+        platform,
+        AppData {
+            aaguid,
+            auto_user_presence: !args.manual_user_presence,
+        },
+    )
+    .expect("usbip transport exited");
 }
 
 #[cfg(test)]

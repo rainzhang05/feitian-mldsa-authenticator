@@ -10,4 +10,24 @@ interchange = "0.3"
 nix = { version = "0.27", default-features = false, features = ["fs", "poll", "signal"] }
 serde = { version = "1", features = ["derive"] }
 signal-hook = { version = "0.3", features = ["iterator"] }
-tokio = { version = "1", features = ["macros", "net", "rt", "time"] }
+transport-core = { path = "../transport-core", default-features = false, features = ["ctaphid"] }
+clap = { version = "4", features = ["derive"] }
+clap-num = "1.0"
+littlefs2 = "0.6"
+littlefs2-core = "0.1"
+log = { version = "0.4", default-features = false }
+pretty_env_logger = { version = "0.4" }
+trussed = { version = "0.1", default-features = false, features = ["log-all", "virt"] }
+authenticator = { path = "../authenticator" }
+
+[dependencies.pc-usbip-runner]
+optional = true
+package = "trussed-usbip"
+path = "../pc-usbip-runner"
+
+[features]
+default = ["uhid-backend"]
+uhid-backend = []
+usbip-backend = ["pc-usbip-runner", "pc-usbip-runner/ctaphid"]
+ctaphid = []
+ccid = []

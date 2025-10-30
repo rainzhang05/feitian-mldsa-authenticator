@@ -6,13 +6,11 @@ edition = "2021"
 
 [dependencies]
 interchange = "0.3.0"
-littlefs2-core = "0.1"
 log = { version = "0.4.14", default-features = false }
-rand_chacha = { version = "0.3", default-features = false }
-rand_core = { version = "0.6", features = ["getrandom"] }
-trussed = { version = "0.1", default-features = false, features = ["log-all", "virt"] }
+transport-core = { path = "../transport-core", default-features = false }
 usb-device = { version = "0.2.7", default-features = false }
 usbip-device = "0.1.5"
+trussed = { version = "0.1", default-features = false, features = ["log-all", "virt"] }
 
 # ctaphid
 ctaphid-dispatch = { version = "0.3", features = ["log-all"], optional = true }
@@ -34,6 +32,7 @@ authenticator = { path = "../authenticator" }
 
 [features]
 default = ["ctaphid"]
-ctaphid = ["ctaphid-dispatch", "usbd-ctaphid"]
-ccid = ["apdu-dispatch", "usbd-ccid"]
+ctaphid = ["ctaphid-dispatch", "usbd-ctaphid", "transport-core/ctaphid"]
+ccid = ["apdu-dispatch", "usbd-ccid", "transport-core/ccid"]
+legacy = []
 

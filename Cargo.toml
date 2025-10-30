@@ -4,7 +4,8 @@ members = [
     "authenticator",
     "trussed-mlkem",
     "pc-usbip-runner",
-    "pc-hid-runner"
+    "pc-hid-runner",
+    "transport-core"
 ]
 
 resolver = "2"
