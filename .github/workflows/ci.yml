@@ -1,0 +1,47 @@
+name: HID runner
+
+on:
+  push:
+    branches: ["*"]
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  framing-tests:
+    runs-on: ubuntu-latest
+    env:
+      CARGO_TARGET_DIR: ${{ github.workspace }}/target
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libclang-dev
+      - name: Run ctaphid framing tests
+        run: cargo test -p pc-hid-runner --lib
+
+  hid-integration:
+    runs-on: ubuntu-latest
+    needs: framing-tests
+    env:
+      CARGO_TARGET_DIR: ${{ github.workspace }}/target
+      PC_HID_RUNNER_E2E: "1"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libclang-dev libudev-dev fido2-tools
+          sudo modprobe uhid || true
+      - name: Build HID runner
+        run: cargo build -p pc-hid-runner
+      - name: Run hid_integration test
+        run: sudo --preserve-env=PATH,CARGO_HOME,RUSTUP_HOME,CARGO_TARGET_DIR,PC_HID_RUNNER_E2E cargo test -p pc-hid-runner --test hid_integration
+      - name: Run fido2-token smoke test
+        run: sudo --preserve-env=PATH,CARGO_HOME,RUSTUP_HOME,CARGO_TARGET_DIR,PC_HID_RUNNER_E2E cargo test -p pc-hid-runner --test fido2_token
+      - name: Run end-to-end script
+        run: sudo --preserve-env=PATH,CARGO_HOME,RUSTUP_HOME,CARGO_TARGET_DIR,PC_HID_RUNNER_E2E ci/hid-e2e.sh

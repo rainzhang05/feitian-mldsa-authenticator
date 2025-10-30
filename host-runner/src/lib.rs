@@ -4,7 +4,7 @@ use std::{
     ops::{Deref, DerefMut},
     sync::{
         atomic::{AtomicBool, Ordering},
-        mpsc::{self, Sender},
+        mpsc::{self, RecvTimeoutError, Sender},
         Arc, Mutex,
     },
     thread,
@@ -33,6 +33,42 @@ static IS_WAITING: AtomicBool = AtomicBool::new(false);
 
 pub fn set_waiting(waiting: bool) {
     IS_WAITING.store(waiting, Ordering::Relaxed)
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct ShutdownListener {
+    flag: Arc<AtomicBool>,
+}
+
+impl ShutdownListener {
+    pub fn new(flag: Arc<AtomicBool>) -> Self {
+        Self { flag }
+    }
+
+    pub fn should_stop(&self) -> bool {
+        self.flag.load(Ordering::Relaxed)
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct ShutdownSignal {
+    flag: Arc<AtomicBool>,
+}
+
+impl ShutdownSignal {
+    pub fn request_shutdown(&self) {
+        self.flag.store(true, Ordering::Relaxed);
+    }
+}
+
+pub fn shutdown_channel() -> (ShutdownSignal, ShutdownListener) {
+    let flag = Arc::new(AtomicBool::new(false));
+    (
+        ShutdownSignal {
+            flag: Arc::clone(&flag),
+        },
+        ShutdownListener { flag },
+    )
 }
 
 pub type Client<D = CoreOnly> = ClientImplementation<'static, Syscall, D>;
@@ -178,6 +214,16 @@ where
     }
 
     pub fn exec(self, platform: Platform, data: A::Data, mut transport: Box<dyn Transport>) {
+        self.run_with_shutdown(platform, data, transport, ShutdownListener::default());
+    }
+
+    pub fn run_with_shutdown(
+        self,
+        platform: Platform,
+        data: A::Data,
+        mut transport: Box<dyn Transport>,
+        shutdown: ShutdownListener,
+    ) {
         let registration = transport.register(&self.options);
         let runtime = Arc::new(Mutex::new(registration));
 
@@ -191,6 +237,7 @@ where
 
         thread::scope(|s| {
             let runtime_for_poll = Arc::clone(&runtime);
+            let shutdown_poll = shutdown.clone();
             s.spawn(move || {
                 let mut transport = transport;
                 let _epoch = Instant::now();
@@ -200,6 +247,9 @@ where
                 let mut timeout_ccid = Timeout::new();
 
                 loop {
+                    if shutdown_poll.should_stop() {
+                        break;
+                    }
                     let mut guard = runtime_for_poll
                         .lock()
                         .expect("transport runtime mutex poisoned");
@@ -228,14 +278,23 @@ where
             });
 
             // trussed task
+            let shutdown_service = shutdown.clone();
             s.spawn(move || {
-                for _ in syscall_receiver.iter() {
-                    service.process(&mut endpoints)
+                while !shutdown_service.should_stop() {
+                    match syscall_receiver.recv_timeout(Duration::from_millis(10)) {
+                        Ok(_) => service.process(&mut endpoints),
+                        Err(RecvTimeoutError::Timeout) => continue,
+                        Err(RecvTimeoutError::Disconnected) => break,
+                    }
                 }
             });
 
             // apps task
+            let shutdown_main = shutdown;
             loop {
+                if shutdown_main.should_stop() {
+                    break;
+                }
                 let mut dispatched = false;
 
                 #[cfg(feature = "ctaphid")]

@@ -422,15 +422,26 @@ impl UhidDevice {
     }
 
     fn decode_packet(&self, data: &[u8]) -> Option<[u8; PACKET_SIZE]> {
-        let expected = if self.output_numbered {
+        if data.len() < PACKET_SIZE {
+            return None;
+        }
+
+        let needs_full = if self.output_numbered {
             PACKET_SIZE + 1
         } else {
             PACKET_SIZE
         };
-        if data.len() < expected {
+
+        if data.len() < needs_full {
             return None;
         }
+
         let offset = if self.output_numbered {
+            if data[0] != REPORT_ID {
+                warn!("unexpected report id {}", data[0]);
+            }
+            1
+        } else if data.len() == PACKET_SIZE + 1 {
             if data[0] != REPORT_ID {
                 warn!("unexpected report id {}", data[0]);
             }
@@ -438,6 +449,11 @@ impl UhidDevice {
         } else {
             0
         };
+
+        if data.len() < offset + PACKET_SIZE {
+            return None;
+        }
+
         let mut packet = [0u8; PACKET_SIZE];
         packet.copy_from_slice(&data[offset..offset + PACKET_SIZE]);
         Some(packet)
