@@ -14,4 +14,12 @@ uhid-virt = "0.0.8"
 nix = { version = "0.28", default-features = false, features = ["poll"] }
 heapless-bytes = "0.3"
 libc = "0.2"
+authenticator = { path = "../authenticator" }
+clap = { version = "3.0.0", features = ["derive"] }
+clap-num = "1.0.0"
+littlefs2 = "0.6"
+littlefs2-core = "0.1"
+pretty_env_logger = "0.4.0"
+trussed = "0.1"
+ctrlc = "3"
 

@@ -1,12 +1,13 @@
 use std::{
     any::Any,
     convert::{TryFrom, TryInto},
-    fs::OpenOptions,
+    fs::{self, OpenOptions},
     io::{self, ErrorKind, Read, Write},
     os::unix::{
         fs::OpenOptionsExt,
         io::{AsRawFd, RawFd},
     },
+    path::PathBuf,
     ptr::NonNull,
     time::{Duration, Instant},
     vec::Vec,
@@ -133,13 +134,17 @@ impl LinuxUhidRuntime {
         requester: ctaphid_dispatch::Requester<'static, { DEFAULT_MESSAGE_SIZE }>,
         dispatch: Dispatch<'static, 'static, { DEFAULT_MESSAGE_SIZE }>,
     ) -> Self {
-        Self {
+        let mut runtime = Self {
             device,
             pipe: HidFramer::new(requester),
             dispatch: Some(dispatch),
             channel: Some(NonNull::from(channel)),
             epoch: Instant::now(),
-        }
+        };
+
+        runtime.device.log_registration();
+
+        runtime
     }
 
     fn elapsed_millis(&self) -> u32 {
@@ -208,6 +213,7 @@ impl LinuxUhidRuntime {
             }
             OutputEvent::Open => {
                 info!("UHID device opened");
+                self.device.log_hidraw_nodes();
             }
             OutputEvent::Close => {
                 info!("UHID device closed");
@@ -308,6 +314,10 @@ struct UhidDevice {
     input_numbered: bool,
     output_numbered: bool,
     feature_numbered: bool,
+    name: String,
+    uniq: String,
+    vid: u16,
+    pid: u16,
 }
 
 impl UhidDevice {
@@ -332,9 +342,9 @@ impl UhidDevice {
             .unwrap_or_else(|| "000000000000".to_string());
 
         let params = CreateParams {
-            name,
+            name: name.clone(),
             phys,
-            uniq,
+            uniq: uniq.clone(),
             bus: Bus::USB,
             vendor: options.vid.into(),
             product: options.pid.into(),
@@ -351,6 +361,10 @@ impl UhidDevice {
             input_numbered: false,
             output_numbered: false,
             feature_numbered: false,
+            name,
+            uniq,
+            vid: options.vid,
+            pid: options.pid,
         })
     }
 
@@ -431,6 +445,75 @@ impl UhidDevice {
 
     fn destroy(&mut self) -> io::Result<()> {
         self.write_event(InputEvent::Destroy)
+    }
+
+    fn log_registration(&self) {
+        info!(
+            "Registered UHID device '{}' vid=0x{vid:04x} pid=0x{pid:04x} on /dev/uhid",
+            self.name,
+            vid = self.vid,
+            pid = self.pid,
+        );
+        self.log_hidraw_nodes();
+    }
+
+    fn hidraw_nodes(&self) -> io::Result<Vec<PathBuf>> {
+        let mut matches = Vec::new();
+        let dir = match fs::read_dir("/sys/class/hidraw") {
+            Ok(dir) => dir,
+            Err(err) => return Err(err),
+        };
+
+        let target = format!("HID_UNIQ={}", self.uniq);
+        let target_str = target.as_str();
+
+        for entry in dir {
+            let entry = match entry {
+                Ok(entry) => entry,
+                Err(err) => {
+                    warn!("failed to enumerate hidraw entry: {err}");
+                    continue;
+                }
+            };
+            let mut path = entry.path();
+            path.push("device/uevent");
+            let data = match fs::read_to_string(&path) {
+                Ok(data) => data,
+                Err(err) => {
+                    warn!("failed to read {}: {err}", path.display());
+                    continue;
+                }
+            };
+            if data.lines().any(|line| line.trim() == target_str) {
+                if let Some(name) = entry.file_name().to_str() {
+                    matches.push(PathBuf::from("/dev").join(name));
+                }
+            }
+        }
+
+        Ok(matches)
+    }
+
+    fn log_hidraw_nodes(&self) {
+        match self.hidraw_nodes() {
+            Ok(nodes) if nodes.is_empty() => {
+                info!(
+                    "Waiting for hidraw node (looking for HID_UNIQ={})",
+                    self.uniq
+                );
+            }
+            Ok(nodes) => {
+                let joined = nodes
+                    .iter()
+                    .map(|path| path.display().to_string())
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                info!("hidraw nodes available: {joined}");
+            }
+            Err(err) => {
+                warn!("unable to enumerate hidraw nodes: {err}");
+            }
+        }
     }
 }
 
