@@ -1,0 +1,17 @@
+[package]
+name = "pc-hid-runner"
+version = "0.1.0"
+edition = "2021"
+
+[features]
+default = ["ctaphid"]
+ctaphid = ["trussed-host-runner/ctaphid"]
+
+[dependencies]
+log = "0.4"
+trussed-host-runner = { path = "../host-runner" }
+uhid-virt = "0.0.8"
+nix = { version = "0.28", default-features = false, features = ["poll"] }
+heapless-bytes = "0.3"
+libc = "0.2"
+
