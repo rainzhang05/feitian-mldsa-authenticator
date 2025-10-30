@@ -19,6 +19,12 @@ jobs:
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
 
+      - name: Build workspace
+        run: cargo build --workspace --all-targets
+
+      - name: Run tests
+        run: cargo test --workspace --all-targets
+
       - name: Install usbip tooling
         run: |
           set -euxo pipefail
