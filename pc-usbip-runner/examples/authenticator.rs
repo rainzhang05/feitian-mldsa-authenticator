@@ -140,7 +140,7 @@ fn main() {
     let options = trussed_usbip::Options {
         manufacturer: Some(args.manufacturer),
         product: Some(args.product),
-        serial_number: args.serial,
+        serial_number: Some(args.serial),
         vid: args.vid,
         pid: args.pid,
         device_class: None,
