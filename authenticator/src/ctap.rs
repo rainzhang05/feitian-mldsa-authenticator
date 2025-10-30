@@ -650,6 +650,7 @@ pub struct CtapApp<C> {
     pending_assertion: Option<PendingAssertion>,
     attestation_private_key: Option<Vec<u8>>,
     attestation_certificate_chain: Option<Vec<Vec<u8>>>,
+    attestation_material_initialized: bool,
     keepalive_callback: fn(bool),
     interrupt_flag: &'static InterruptFlag,
     auto_user_presence: bool,
@@ -673,17 +674,13 @@ where
             pending_assertion: None,
             attestation_private_key: None,
             attestation_certificate_chain: None,
+            attestation_material_initialized: false,
             keepalive_callback: noop_keepalive,
             interrupt_flag: Box::leak(Box::new(InterruptFlag::new())),
             auto_user_presence: false,
             #[cfg(test)]
             stored_credentials: Vec::new(),
         };
-
-        if app.load_attestation_material().is_err() {
-            app.clear_attestation_material();
-        }
-
         app
     }
 
@@ -1304,6 +1301,31 @@ where
             key.zeroize();
         }
         self.attestation_certificate_chain = None;
+        self.attestation_material_initialized = false;
+    }
+
+    fn ensure_attestation_material(&mut self) {
+        if self.attestation_material_initialized {
+            return;
+        }
+
+        if matches!(
+            (
+                self.attestation_private_key.as_ref(),
+                self.attestation_certificate_chain.as_ref()
+            ),
+            (Some(_), Some(chain)) if !chain.is_empty()
+        ) {
+            self.attestation_material_initialized = true;
+            return;
+        }
+
+        self.attestation_material_initialized = true;
+
+        if self.load_attestation_material().is_err() {
+            self.clear_attestation_material();
+            self.attestation_material_initialized = true;
+        }
     }
 
     #[cfg(not(test))]
@@ -1355,10 +1377,12 @@ where
     }
 
     fn attestation_signature(
-        &self,
+        &mut self,
         auth_data: &[u8],
         client_hash: &[u8],
     ) -> Result<Option<(Vec<u8>, Vec<Vec<u8>>)>, u8> {
+        self.ensure_attestation_material();
+
         let (key_bytes, chain) = match (
             self.attestation_private_key.as_ref(),
             self.attestation_certificate_chain.as_ref(),
@@ -1371,8 +1395,7 @@ where
             return Err(CTAP2_ERR_PROCESSING);
         }
 
-        let signing_key =
-            SigningKey::from_slice(key_bytes).map_err(|_| CTAP2_ERR_PROCESSING)?;
+        let signing_key = SigningKey::from_slice(key_bytes).map_err(|_| CTAP2_ERR_PROCESSING)?;
         let mut message = Vec::with_capacity(auth_data.len() + client_hash.len());
         message.extend_from_slice(auth_data);
         message.extend_from_slice(client_hash);

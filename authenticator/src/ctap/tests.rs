@@ -1453,8 +1453,7 @@ fn make_credential_uses_attestation_certificate_when_available() {
         "certificate chain returned",
     );
 
-    let signing_key =
-        SigningKey::from_slice(&att_key_bytes).expect("valid attestation key");
+    let signing_key = SigningKey::from_slice(&att_key_bytes).expect("valid attestation key");
     let mut message = Vec::with_capacity(auth_data.len() + client_hash.len());
     message.extend_from_slice(&auth_data);
     message.extend_from_slice(&client_hash);
