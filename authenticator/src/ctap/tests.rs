@@ -1355,7 +1355,6 @@ fn get_assertion_returns_not_allowed_when_presence_denied() {
 fn make_credential_uses_attestation_certificate_when_available() {
     let mut app = CtapApp::new(TestClient::new(), [0xAB; 16]);
     let att_key_bytes = vec![0x13; 32];
-    let secret = P256SecretKey::from_slice(&att_key_bytes).expect("valid attestation key");
     let certificate = vec![0x30, 0x82, 0x00, 0x01];
     app.attestation_private_key = Some(att_key_bytes.clone());
     app.attestation_certificate_chain = Some(vec![certificate.clone()]);
@@ -1454,7 +1453,8 @@ fn make_credential_uses_attestation_certificate_when_available() {
         "certificate chain returned",
     );
 
-    let signing_key = SigningKey::from(secret);
+    let signing_key =
+        SigningKey::from_slice(&att_key_bytes).expect("valid attestation key");
     let mut message = Vec::with_capacity(auth_data.len() + client_hash.len());
     message.extend_from_slice(&auth_data);
     message.extend_from_slice(&client_hash);

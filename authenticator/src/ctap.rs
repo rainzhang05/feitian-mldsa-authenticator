@@ -1371,8 +1371,8 @@ where
             return Err(CTAP2_ERR_PROCESSING);
         }
 
-        let secret_key = P256SecretKey::from_slice(key_bytes).map_err(|_| CTAP2_ERR_PROCESSING)?;
-        let signing_key = SigningKey::from(secret_key);
+        let signing_key =
+            SigningKey::from_slice(key_bytes).map_err(|_| CTAP2_ERR_PROCESSING)?;
         let mut message = Vec::with_capacity(auth_data.len() + client_hash.len());
         message.extend_from_slice(auth_data);
         message.extend_from_slice(client_hash);
