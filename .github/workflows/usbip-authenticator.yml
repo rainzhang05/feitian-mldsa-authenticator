@@ -22,8 +22,26 @@ jobs:
 
       - name: Install usbip tooling
         run: |
+          set -euxo pipefail
           sudo apt-get update
-          sudo apt-get install -y linux-tools-$(uname -r) linux-cloud-tools-$(uname -r)
+          packages=(
+            "linux-tools-$(uname -r)"
+            "linux-cloud-tools-$(uname -r)"
+            linux-tools-generic
+            linux-cloud-tools-generic
+            linux-tools-virtual
+            linux-cloud-tools-virtual
+            usbip
+          )
+          for pkg in "${packages[@]}"; do
+            if apt-cache show "$pkg" >/dev/null 2>&1; then
+              sudo apt-get install -y "$pkg"
+            fi
+          done
+          if ! command -v usbip >/dev/null 2>&1; then
+            echo "usbip CLI was not installed" >&2
+            exit 1
+          fi
 
       - name: Start authenticator USB/IP server
         run: |
