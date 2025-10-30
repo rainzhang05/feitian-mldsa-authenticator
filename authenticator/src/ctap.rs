@@ -910,7 +910,7 @@ where
     fn client_pin_get_key_agreement(&mut self, protocol: PinProtocol) -> Result<Vec<u8>, u8> {
         let session = match protocol {
             PinProtocol::Pqc => {
-                let param_set = KemParamSet::MLKem512;
+                let param_set = KemParamSet::MLKEM512;
                 let (public_key, secret_key) = trussed_mlkem::keypair(param_set);
                 PinProtocolSession::Pqc {
                     param_set,

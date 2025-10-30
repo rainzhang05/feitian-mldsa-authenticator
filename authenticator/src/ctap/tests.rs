@@ -114,13 +114,13 @@ impl TrussedClient for TestClient {}
 fn pqc_key_agreement_value_is_canonical_akp_map() {
     let public_key = vec![0x01, 0x02];
     let session = PinProtocolSession::Pqc {
-        param_set: KemParamSet::MLKem512,
+        param_set: KemParamSet::MLKEM512,
         secret_key: KemSecretKey(vec![]),
         public_key: public_key.clone(),
     };
 
     let value = session.key_agreement_value();
-    let expected_alg = cose_alg_for_kem_param_set(KemParamSet::MLKem512);
+    let expected_alg = cose_alg_for_kem_param_set(KemParamSet::MLKEM512);
     assert_eq!(value, cose_akp_key_map(expected_alg, &public_key));
 
     let mut encoded = Vec::new();
