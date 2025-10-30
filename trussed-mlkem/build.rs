@@ -7,12 +7,26 @@ fn workspace_root() -> PathBuf {
     PathBuf::from(env::var("CARGO_MANIFEST_DIR").expect("CARGO_MANIFEST_DIR")).join("..")
 }
 
+fn target_subdir() -> String {
+    let arch = env::var("CARGO_CFG_TARGET_ARCH").expect("CARGO_CFG_TARGET_ARCH");
+    let os = env::var("CARGO_CFG_TARGET_OS").expect("CARGO_CFG_TARGET_OS");
+    match (os.as_str(), arch.as_str()) {
+        ("linux", "aarch64") => "linux-aarch64".to_string(),
+        ("linux", "x86_64") => "linux-x86_64".to_string(),
+        _ => panic!("unsupported prebuilt liboqs target {os}-{arch}"),
+    }
+}
+
 fn lib_directory(root: &Path) -> PathBuf {
-    root.join("prebuilt_liboqs/linux-aarch64/lib")
+    root.join("prebuilt_liboqs")
+        .join(target_subdir())
+        .join("lib")
 }
 
 fn include_directory(root: &Path) -> PathBuf {
-    root.join("prebuilt_liboqs/linux-aarch64/include")
+    root.join("prebuilt_liboqs")
+        .join(target_subdir())
+        .join("include")
 }
 
 fn ensure_symbol(lib: &Path, symbol: &str) {
@@ -43,13 +57,20 @@ enum LibraryKind {
     Dynamic,
 }
 
+const SHARED_CANDIDATES: &[&str] = &[
+    "liboqs.so",
+    "liboqs.so.0.15.0-rc1",
+    "liboqs.so.9",
+    "liboqs.so.0.14.1-dev",
+    "liboqs.so.8",
+];
+
 fn select_library(lib_dir: &Path) -> (PathBuf, LibraryKind) {
     let static_lib = lib_dir.join("liboqs.a");
     if static_lib.exists() {
         return (static_lib, LibraryKind::Static);
     }
-    let shared_candidates = ["liboqs.so", "liboqs.so.0.14.1-dev", "liboqs.so.8"];
-    for candidate in shared_candidates.iter().map(|name| lib_dir.join(name)) {
+    for candidate in SHARED_CANDIDATES.iter().map(|name| lib_dir.join(name)) {
         if let Ok(meta) = candidate.metadata() {
             if meta.len() > 1024 {
                 return (candidate, LibraryKind::Dynamic);
@@ -76,14 +97,21 @@ fn main() {
         }
         LibraryKind::Dynamic => {
             let out_dir = PathBuf::from(env::var("OUT_DIR").expect("OUT_DIR"));
-            for name in ["liboqs.so", "liboqs.so.8", "liboqs.so.0.14.1-dev"] {
-                let target_path = out_dir.join(name);
-                fs::copy(&link_target, &target_path)
-                    .unwrap_or_else(|e| panic!("failed to stage {name}: {e}"));
+            for name in SHARED_CANDIDATES {
+                let source = lib_dir.join(name);
+                if let Ok(meta) = source.metadata() {
+                    if meta.len() > 0 {
+                        let target_path = out_dir.join(name);
+                        fs::copy(&source, &target_path)
+                            .unwrap_or_else(|e| panic!("failed to stage {name}: {e}"));
+                    }
+                }
             }
             println!("cargo:rustc-link-search=native={}", out_dir.display());
             println!("cargo:rustc-link-search=native={}", lib_dir.display());
             println!("cargo:rustc-link-lib=dylib=oqs");
+            println!("cargo:rustc-link-arg=-Wl,-rpath,{}", out_dir.display());
+            println!("cargo:rustc-link-arg=-Wl,-rpath,{}", lib_dir.display());
         }
     }
 

@@ -35,15 +35,52 @@ Options:
 ```
 
 The provided options are forwarded to the USB/IP runner so the CTAPHID stack
-identifies itself using the supplied VID/PID and product strings.
+identifies itself using the supplied VID/PID and product strings. The crate
+enables the CTAPHID transport by default; enable the `ccid` feature when you
+also want to expose the smart-card interface.
 
 By default the example automatically fulfils user-presence checks so that the
 VM workflow can progress without manual intervention. Pass
 `--manual-user-presence` to disable the auto-confirmation and exercise the
 normal polling path instead.
 
-## Other examples
+### Choosing the correct `liboqs` binaries
 
-The previous `dummy` example is still available and can be run with
-`cargo run --example dummy` if you need the simple CTAPHID vendor command
-handler used during bring-up.
+The ML-DSA and ML-KEM wrappers link against prebuilt `liboqs` artifacts. Pick
+the directory that matches the target triple you're building for:
+
+```sh
+uname -m
+```
+
+* `aarch64` → use `prebuilt_liboqs/linux-aarch64`
+* `x86_64` → populate `prebuilt_liboqs/linux-x86_64` with the headers and
+  libraries from the [liboqs release artifacts][liboqs-release]
+
+Because the chat environment cannot upload binary artifacts, the x86_64
+directory is intentionally left empty in commits. When developing on an x86_64
+system, download the official `liboqs` release tarball, extract the `lib` and
+`include` directories and copy them into `prebuilt_liboqs/linux-x86_64/` before
+building.
+
+When running the compiled binary outside of `cargo run`, export
+`LD_LIBRARY_PATH=/path/to/prebuilt_liboqs/<target>/lib` so the dynamic linker can
+locate `liboqs.so`.
+
+[liboqs-release]: https://github.com/open-quantum-safe/liboqs/releases
+
+## USB/IP usage
+
+Once the runner is active you can attach it using the standard usbip flow:
+
+```sh
+sudo modprobe vhci-hcd
+sudo usbip list -r localhost
+sudo usbip attach -r localhost -b 1-1
+sudo usbip port
+lsusb
+```
+
+The authenticator will then appear as a FIDO CTAPHID device and can be used
+for registration and authentication ceremonies with WebAuthn-compatible
+relying parties.
