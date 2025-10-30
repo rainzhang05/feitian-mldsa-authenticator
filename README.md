@@ -1,4 +1,4 @@
-# Feitian FIDO2 Software Authenticator
+# FIDO2 Software Authenticator
 
 Software authenticator implementing post-quantum ML-DSA 44/65/87 with a Trussed-based stack in Rust, using the liboqs library for ML-DSA algorithm implementations. The project includes a patched and modified PC USB/IP runner so you can develop and test without flashing hardware. It exposes a FIDO2/CTAP2 HID interface and CCID that browsers and tooling can use for WebAuthn.
 
