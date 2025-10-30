@@ -1,3 +1,4 @@
+pub mod permissions;
 pub mod service;
 pub mod transport;
 pub mod uhid;
@@ -109,7 +110,20 @@ where
     D::Context: Send + Sync,
     A: Apps<'interrupt, D>,
 {
+    let descriptor_clone = descriptor.clone();
     let device = UhidDevice::new(descriptor)?;
+    if let Ok(nodes) = permissions::hidraw_nodes_for_descriptor(&descriptor_clone) {
+        for node in nodes {
+            let mode = node.mode & 0o777;
+            if mode & 0o007 != 0 {
+                log::warn!(
+                    "{} is world-accessible (mode {:o}); install the bundled udev rule or tighten permissions",
+                    node.path.display(),
+                    mode
+                );
+            }
+        }
+    }
     let channel: Channel<{ DEFAULT_MESSAGE_SIZE }> = Channel::new();
     let (requester, responder) = channel
         .split()

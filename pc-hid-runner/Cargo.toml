@@ -7,7 +7,7 @@ edition = "2021"
 ctaphid-dispatch = { version = "0.3", features = ["log-all"] }
 heapless-bytes = "0.3"
 interchange = "0.3"
-nix = { version = "0.27", default-features = false, features = ["fs", "poll", "signal"] }
+nix = { version = "0.27", default-features = false, features = ["fs", "poll", "signal", "user"] }
 serde = { version = "1", features = ["derive"] }
 signal-hook = { version = "0.3", features = ["iterator"] }
 transport-core = { path = "../transport-core", default-features = false, features = ["ctaphid"] }

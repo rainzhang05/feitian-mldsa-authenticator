@@ -101,3 +101,31 @@ Detaching/resetting:
 sudo usbip detach -p 0 || true
 sudo modprobe -r vhci-hcd; sudo modprobe vhci-hcd
 ```
+
+## Restricting local HID access
+
+The HID runner creates a hidraw character device that any local process could read if the
+node is world-accessible. Install the bundled udev rule to limit access to the
+`plugdev` group (or another group of your choice):
+
+```bash
+sudo install -m 0644 contrib/udev/70-feitian-authenticator.rules /etc/udev/rules.d/
+sudo udevadm control --reload
+```
+
+Add your user to the selected group and re-login so browsers and other applications can
+reach the authenticator:
+
+```bash
+sudo usermod -aG plugdev "$USER"
+```
+
+When the device is running you can confirm permissions via `/sys/class/hidraw`:
+
+```bash
+grep HID_ID /sys/class/hidraw/hidraw*/device/uevent | grep 096E:0858
+ls -l /dev/hidraw*
+```
+
+The CLI warns if `/dev/uhid` is inaccessible or if the hidraw node ends up world-readable,
+prompting you to adjust the rule or group membership.

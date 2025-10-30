@@ -16,7 +16,8 @@ use nix::{
     sys::signal::{self, Signal},
     unistd::Pid,
 };
-use pc_hid_runner::{service, Options};
+use nix::unistd::{self, Gid, Group};
+use pc_hid_runner::{permissions, service, HidDeviceDescriptor, Options};
 use transport_core::state::default_state_dir;
 
 #[derive(Parser, Debug)]
@@ -231,6 +232,8 @@ fn start(cmd: StartCommand) -> io::Result<()> {
         .to_runner_config()
         .map_err(|err| io::Error::new(io::ErrorKind::InvalidInput, err))?;
 
+    warn_device_permissions(&config.descriptor);
+
     if cmd.foreground {
         fs::write(&pid_path, format!("{}\n", process::id()))?;
         let result = run_service(config);
@@ -263,6 +266,69 @@ fn start(cmd: StartCommand) -> io::Result<()> {
     let result = run_service(config);
     fs::remove_file(&pid_path).ok();
     result
+}
+
+fn warn_device_permissions(descriptor: &HidDeviceDescriptor) {
+    let euid = unistd::geteuid();
+    if euid.is_root() {
+        return;
+    }
+
+    match permissions::check_uhid_access() {
+        Ok(_) => {}
+        Err(err) if err.kind() == io::ErrorKind::PermissionDenied => {
+            warn_group_membership();
+        }
+        Err(err) if err.kind() == io::ErrorKind::NotFound => {
+            eprintln!(
+                "warning: /dev/uhid is not available. Load the uhid kernel module with 'sudo modprobe uhid'."
+            );
+        }
+        Err(_) => {}
+    }
+
+    if let Ok(nodes) = permissions::hidraw_nodes_for_descriptor(descriptor) {
+        for node in nodes {
+            let mode = node.mode & 0o777;
+            if mode & 0o007 != 0 {
+                eprintln!(
+                    "warning: {} is world-accessible (mode {:o}). Install contrib/udev/70-feitian-authenticator.rules or tighten permissions.",
+                    node.path.display(),
+                    mode
+                );
+            }
+        }
+    }
+}
+
+fn warn_group_membership() {
+    const GROUP_NAME: &str = "plugdev";
+    let plugdev_gid = group_by_name(GROUP_NAME);
+    let groups = unistd::getgroups().unwrap_or_default();
+    let egid = unistd::getegid();
+
+    if let Some(gid) = plugdev_gid {
+        if !groups.contains(&gid) && egid != gid {
+            eprintln!(
+                "warning: insufficient permissions to access /dev/uhid. Add your user to the '{}' group or adjust contrib/udev/70-feitian-authenticator.rules.",
+                GROUP_NAME
+            );
+        } else {
+            eprintln!(
+                "warning: unable to access /dev/uhid even though '{}' group is present. Verify the udev rule contrib/udev/70-feitian-authenticator.rules is installed.",
+                GROUP_NAME
+            );
+        }
+    } else {
+        eprintln!(
+            "warning: insufficient permissions to access /dev/uhid and '{}' group was not found. Install contrib/udev/70-feitian-authenticator.rules and adjust the GROUP value for your system.",
+            GROUP_NAME
+        );
+    }
+}
+
+fn group_by_name(name: &str) -> Option<Gid> {
+    Group::from_name(name).ok().flatten().map(|g| g.gid)
 }
 
 fn stop(state: StateArgs) -> io::Result<()> {
