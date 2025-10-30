@@ -220,12 +220,18 @@ const CREDENTIAL_STORE_PATH: &str = "credentials.cbor";
 const ATTESTATION_STORE_PATH: &str = "attestation.cbor";
 const PIN_UV_AUTH_PROTOCOL_CLASSIC_V1: i32 = 1;
 const PIN_UV_AUTH_PROTOCOL_CLASSIC_V2: i32 = 2;
+#[cfg_attr(not(test), allow(dead_code))]
 const PIN_UV_AUTH_PROTOCOL_CLASSIC: i32 = PIN_UV_AUTH_PROTOCOL_CLASSIC_V2;
-const SUPPORTED_PIN_UV_PROTOCOLS: [i32; 3] = [
+const PIN_UV_PROTOCOLS_PREFER: [i32; 3] = [
     PIN_UV_AUTH_PROTOCOL_PQC as i32,
     PIN_UV_AUTH_PROTOCOL_CLASSIC_V2,
     PIN_UV_AUTH_PROTOCOL_CLASSIC_V1,
 ];
+const PIN_UV_PROTOCOLS_CLASSIC: [i32; 2] = [
+    PIN_UV_AUTH_PROTOCOL_CLASSIC_V2,
+    PIN_UV_AUTH_PROTOCOL_CLASSIC_V1,
+];
+const PIN_UV_PROTOCOLS_PQC_ONLY: [i32; 1] = [PIN_UV_AUTH_PROTOCOL_PQC as i32];
 
 const PIN_PERMISSION_MC: u8 = 0x01;
 const PIN_PERMISSION_GA: u8 = 0x02;
@@ -639,12 +645,26 @@ impl PinProtocolSession {
 #[cfg(test)]
 mod tests;
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PqcPolicy {
+    PreferPqc,
+    ClassicOnly,
+    RequirePqc,
+}
+
+impl Default for PqcPolicy {
+    fn default() -> Self {
+        Self::PreferPqc
+    }
+}
+
 pub struct CtapApp<C> {
     client: C,
     aaguid: [u8; 16],
     pin_state: PinState,
     pin_protocol_session: Option<PinProtocolSession>,
     platform_declined_pqc: bool,
+    pqc_policy: PqcPolicy,
     suppress_attestation: bool,
     cred_mgmt_state: CredentialManagementState,
     pending_assertion: Option<PendingAssertion>,
@@ -663,12 +683,13 @@ where
     C: TrussedClient + FilesystemClient + CryptoClient,
 {
     pub fn new(client: C, aaguid: [u8; 16]) -> Self {
-        let mut app = Self {
+        let app = Self {
             client,
             aaguid,
             pin_state: PinState::new(),
             pin_protocol_session: None,
             platform_declined_pqc: false,
+            pqc_policy: PqcPolicy::default(),
             suppress_attestation: false,
             cred_mgmt_state: CredentialManagementState::new(),
             pending_assertion: None,
@@ -692,8 +713,21 @@ where
         self.auto_user_presence = enabled;
     }
 
+    pub fn set_pqc_policy(&mut self, policy: PqcPolicy) {
+        self.pqc_policy = policy;
+        self.platform_declined_pqc = matches!(policy, PqcPolicy::ClassicOnly);
+    }
+
     pub fn suppress_attestation(&mut self, suppress: bool) {
         self.suppress_attestation = suppress;
+    }
+
+    fn supported_pin_uv_protocols(&self) -> &'static [i32] {
+        match self.pqc_policy {
+            PqcPolicy::PreferPqc => &PIN_UV_PROTOCOLS_PREFER,
+            PqcPolicy::ClassicOnly => &PIN_UV_PROTOCOLS_CLASSIC,
+            PqcPolicy::RequirePqc => &PIN_UV_PROTOCOLS_PQC_ONLY,
+        }
     }
     fn verify_pin_auth(
         protocol: PinProtocol,
@@ -778,12 +812,12 @@ where
         out
     }
 
-    fn ensure_supported_pin_uv_protocol(protocol: i128) -> Result<(), u8> {
+    fn ensure_supported_pin_uv_protocol(&self, protocol: i128) -> Result<(), u8> {
         if protocol < i32::MIN as i128 || protocol > i32::MAX as i128 {
             return Err(CTAP2_ERR_PIN_AUTH_INVALID);
         }
         let protocol_i32 = protocol as i32;
-        if SUPPORTED_PIN_UV_PROTOCOLS.contains(&protocol_i32) {
+        if self.supported_pin_uv_protocols().contains(&protocol_i32) {
             Ok(())
         } else {
             Err(CTAP2_ERR_PIN_AUTH_INVALID)
@@ -873,23 +907,40 @@ where
             let value: i128 = int.clone().into();
             match value {
                 v if v == i128::from(PIN_UV_AUTH_PROTOCOL_PQC) => {
+                    if matches!(self.pqc_policy, PqcPolicy::ClassicOnly) {
+                        return Err(CTAP1_ERR_INVALID_PARAMETER);
+                    }
                     self.platform_declined_pqc = false;
                     Ok(PinProtocol::Pqc)
                 }
                 v if v == i128::from(PIN_UV_AUTH_PROTOCOL_CLASSIC_V2) => {
+                    if matches!(self.pqc_policy, PqcPolicy::RequirePqc) {
+                        return Err(CTAP1_ERR_INVALID_PARAMETER);
+                    }
                     self.platform_declined_pqc = true;
                     Ok(PinProtocol::Classic(ClassicPinProtocol::V2))
                 }
                 v if v == i128::from(PIN_UV_AUTH_PROTOCOL_CLASSIC_V1) => {
+                    if matches!(self.pqc_policy, PqcPolicy::RequirePqc) {
+                        return Err(CTAP1_ERR_INVALID_PARAMETER);
+                    }
                     self.platform_declined_pqc = true;
                     Ok(PinProtocol::Classic(ClassicPinProtocol::V1))
                 }
                 _ => Err(CTAP1_ERR_INVALID_PARAMETER),
             }
-        } else if self.platform_declined_pqc {
-            Ok(PinProtocol::Classic(ClassicPinProtocol::V2))
         } else {
-            Ok(PinProtocol::Pqc)
+            match self.pqc_policy {
+                PqcPolicy::PreferPqc => {
+                    if self.platform_declined_pqc {
+                        Ok(PinProtocol::Classic(ClassicPinProtocol::V2))
+                    } else {
+                        Ok(PinProtocol::Pqc)
+                    }
+                }
+                PqcPolicy::ClassicOnly => Ok(PinProtocol::Classic(ClassicPinProtocol::V2)),
+                PqcPolicy::RequirePqc => Ok(PinProtocol::Pqc),
+            }
         }
     }
 
@@ -1834,13 +1885,12 @@ where
             Value::Integer(Integer::from(2048)),
         ));
 
-        map.push((
-            Value::Integer(Integer::from(6)),
-            Value::Array(vec![
-                Value::Integer(Integer::from(i32::from(PIN_UV_AUTH_PROTOCOL_PQC))),
-                Value::Integer(Integer::from(PIN_UV_AUTH_PROTOCOL_CLASSIC)),
-            ]),
-        ));
+        let protocols = self
+            .supported_pin_uv_protocols()
+            .iter()
+            .map(|protocol| Value::Integer(Integer::from(*protocol)))
+            .collect();
+        map.push((Value::Integer(Integer::from(6)), Value::Array(protocols)));
 
         map.push((
             Value::Integer(Integer::from(8)),
@@ -1912,7 +1962,7 @@ where
             Some(Value::Integer(int)) => int.clone().into(),
             _ => return Err(CTAP2_ERR_PIN_AUTH_INVALID),
         };
-        Self::ensure_supported_pin_uv_protocol(protocol_value)?;
+        self.ensure_supported_pin_uv_protocol(protocol_value)?;
 
         let pin_auth_param = match Self::map_get(&map, Value::Integer(Integer::from(4))) {
             Some(Value::Bytes(bytes)) => bytes.clone(),
@@ -2143,7 +2193,7 @@ where
             (pin_uv_auth_param.as_ref(), pin_uv_auth_protocol)
         {
             let value: i128 = protocol.into();
-            Self::ensure_supported_pin_uv_protocol(value)?;
+            self.ensure_supported_pin_uv_protocol(value)?;
             if pin_uv_auth_param.len() != 16 && pin_uv_auth_param.len() != 32 {
                 return Err(CTAP2_ERR_PIN_AUTH_INVALID);
             }
@@ -2382,7 +2432,7 @@ where
         let mut user_verified = false;
         match (pin_uv_auth_param.as_ref(), pin_uv_auth_protocol) {
             (Some(param), Some(protocol)) => {
-                Self::ensure_supported_pin_uv_protocol(protocol)?;
+                self.ensure_supported_pin_uv_protocol(protocol)?;
                 if param.len() != 16 && param.len() != 32 {
                     return Err(CTAP2_ERR_PIN_AUTH_INVALID);
                 }

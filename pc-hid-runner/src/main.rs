@@ -1,22 +1,10 @@
 use std::path::PathBuf;
 
-use authenticator::ctap::CtapApp;
+use authenticator::ctap::PqcPolicy;
 use clap::{Parser, ValueEnum};
 use clap_num::maybe_hex;
-use littlefs2::path;
-use pc_hid_runner::{
-    exec, set_waiting, Builder, Client, HidDeviceDescriptor, Options, Platform, Syscall,
-    CTAPHID_FRAME_LEN,
-};
-#[cfg(feature = "usbip-backend")]
-use pc_usbip_runner::{exec as usbip_exec, Builder as UsbipBuilder};
-use transport_core::state::{default_state_dir, IdentityConfig, PersistentStore};
-use trussed::{
-    backend::{CoreOnly, NoId},
-    pipe::{ServiceEndpoint, TrussedChannel},
-    service::Service,
-    types::{CoreContext, NoData},
-};
+use pc_hid_runner::{service, Options};
+use transport_core::state::default_state_dir;
 
 #[derive(Parser, Debug)]
 #[clap(about, version, author)]
@@ -69,77 +57,51 @@ struct Args {
     #[clap(long)]
     manual_user_presence: bool,
 
+    /// Suppress attestation certificate material for makeCredential operations
+    #[clap(long)]
+    suppress_attestation: bool,
+
+    /// Policy controlling whether PQC PIN/UV is preferred, required, or disabled
+    #[clap(long, value_enum, default_value_t = PqcPolicyArg::Prefer)]
+    pqc_policy: PqcPolicyArg,
+
     /// Backend transport to use
-    #[clap(long, value_enum, default_value_t = Backend::Uhid)]
-    backend: Backend,
+    #[clap(long, value_enum, default_value_t = BackendArg::Uhid)]
+    backend: BackendArg,
 }
 
 #[derive(Copy, Clone, Debug, ValueEnum, PartialEq, Eq)]
-enum Backend {
+enum BackendArg {
     Uhid,
     #[cfg(feature = "usbip-backend")]
     Usbip,
 }
 
-#[derive(Clone, Copy)]
-struct AppData {
-    aaguid: [u8; 16],
-    auto_user_presence: bool,
+#[derive(Copy, Clone, Debug, ValueEnum, PartialEq, Eq)]
+enum PqcPolicyArg {
+    Prefer,
+    ClassicOnly,
+    Require,
 }
 
-struct Apps {
-    ctap: CtapApp<Client>,
-}
-
-impl<'a> pc_hid_runner::Apps<'a, CoreOnly> for Apps {
-    type Data = AppData;
-
-    fn new(
-        _service: &mut Service<Platform, CoreOnly>,
-        endpoints: &mut Vec<ServiceEndpoint<'static, NoId, NoData>>,
-        syscall: Syscall,
-        data: Self::Data,
-    ) -> Self {
-        static CHANNEL: TrussedChannel = TrussedChannel::new();
-        let (requester, responder) = CHANNEL.split().expect("Trussed channel split");
-        let context = CoreContext::new(path!("authenticator").into());
-        endpoints.push(ServiceEndpoint::new(responder, context, &[]));
-        let client = Client::new(requester, syscall, None);
-        let mut ctap = CtapApp::new(client, data.aaguid);
-        ctap.set_auto_user_presence(data.auto_user_presence);
-        ctap.set_keepalive_callback(set_waiting);
-        Self { ctap }
-    }
-
-    fn with_ctaphid_apps<T, const N: usize>(
-        &mut self,
-        f: impl FnOnce(&mut [&mut dyn ctaphid_dispatch::app::App<'a, N>]) -> T,
-    ) -> T {
-        f(&mut [&mut self.ctap])
-    }
-
-    #[cfg(feature = "ccid")]
-    fn with_ccid_apps<T, const N: usize>(
-        &mut self,
-        f: impl FnOnce(&mut [&mut dyn apdu_dispatch::app::App<N>]) -> T,
-    ) -> T {
-        f(&mut [])
+impl From<PqcPolicyArg> for PqcPolicy {
+    fn from(value: PqcPolicyArg) -> Self {
+        match value {
+            PqcPolicyArg::Prefer => PqcPolicy::PreferPqc,
+            PqcPolicyArg::ClassicOnly => PqcPolicy::ClassicOnly,
+            PqcPolicyArg::Require => PqcPolicy::RequirePqc,
+        }
     }
 }
 
-fn parse_aaguid(input: &str) -> Result<[u8; 16], String> {
-    let mut cleaned = input.to_owned();
-    cleaned.retain(|c| c != '-');
-    if cleaned.len() != 32 {
-        return Err(format!("expected 32 hex characters, got {}", cleaned.len()));
+impl BackendArg {
+    fn into_backend(self) -> service::Backend {
+        match self {
+            BackendArg::Uhid => service::Backend::Uhid,
+            #[cfg(feature = "usbip-backend")]
+            BackendArg::Usbip => service::Backend::Usbip,
+        }
     }
-    let mut out = [0u8; 16];
-    for (idx, chunk) in cleaned.as_bytes().chunks(2).enumerate() {
-        let hex = std::str::from_utf8(chunk).map_err(|_| "invalid UTF-8 in AAGUID".to_string())?;
-        out[idx] =
-            u8::from_str_radix(hex, 16).map_err(|_| format!("invalid hex at byte {}", idx))?;
-    }
-    Ok(out)
 }
 
 fn main() {
@@ -159,21 +121,12 @@ fn main() {
         pid,
         aaguid: aaguid_str,
         manual_user_presence,
+        suppress_attestation,
+        pqc_policy,
         backend,
     } = args;
 
-    let aaguid = parse_aaguid(&aaguid_str).expect("invalid AAGUID");
-
-    let mut persistent = PersistentStore::new(&state_dir).expect("failed to open persistent store");
-    persistent
-        .initialize_identity(IdentityConfig {
-            aaguid,
-            manufacturer: &manufacturer,
-            product: &product,
-            serial: &serial,
-        })
-        .expect("failed to initialize persistent state");
-    let store = persistent.store();
+    let aaguid = service::parse_aaguid(&aaguid_str).expect("invalid AAGUID");
 
     let options = Options {
         manufacturer: Some(manufacturer.clone()),
@@ -184,42 +137,22 @@ fn main() {
         device_class: None,
     };
 
-    match backend {
-        Backend::Uhid => {
-            let platform = Platform::new(store);
-            let descriptor = HidDeviceDescriptor {
-                name: name.clone(),
-                vendor_id,
-                product_id,
-                version,
-                country: 0,
-                feature_report: vec![0; CTAPHID_FRAME_LEN],
-            };
-            let runner = Builder::new(options.clone()).build::<Apps>();
-            exec(
-                runner,
-                descriptor,
-                platform,
-                AppData {
-                    aaguid,
-                    auto_user_presence: !manual_user_presence,
-                },
-            )
-            .expect("UHID transport exited");
-        }
-        #[cfg(feature = "usbip-backend")]
-        Backend::Usbip => {
-            let platform = Platform::new(store);
-            let runner = UsbipBuilder::new(options.clone()).build::<Apps>();
-            usbip_exec(
-                runner,
-                platform,
-                AppData {
-                    aaguid,
-                    auto_user_presence: !manual_user_presence,
-                },
-            )
-            .expect("USB/IP transport exited");
-        }
-    }
+    let descriptor = service::descriptor(name, vendor_id, product_id, version);
+    let config = service::RunnerConfig {
+        descriptor,
+        options,
+        state_dir: state_dir.clone(),
+        aaguid,
+        identity: service::IdentityStrings {
+            manufacturer,
+            product,
+            serial,
+        },
+        auto_user_presence: !manual_user_presence,
+        suppress_attestation,
+        pqc_policy: pqc_policy.into(),
+        backend: backend.into_backend(),
+    };
+
+    service::run(config).expect("transport exited unexpectedly");
 }
