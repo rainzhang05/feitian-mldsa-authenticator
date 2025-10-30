@@ -12,7 +12,8 @@ Use this checklist to confirm the software authenticator behaves like a producti
 ## Checklist
 
 1. **Start the runner**
-   - Launch the service in the foreground: `cargo run -p pc-hid-runner -- start`.
+   - Launch the service in the foreground: `cargo run -p pc-hid-runner -- start --foreground`.
+   - Omit `--foreground` if you prefer to daemonise the service and monitor it via the log file in the state directory.
    - Confirm that a new `hidraw` node appears and is owned by the secure group specified in `contrib/udev/70-feitian-authenticator.rules`.
    - Run `fido2-token -L` and ensure the authenticator is detected with AAGUID and protocol listings.
 
@@ -34,7 +35,7 @@ Use this checklist to confirm the software authenticator behaves like a producti
    - Confirm the runner logs a cancelled request and the CLI remains responsive.
 
 6. **Manual user presence**
-   - Restart the service with `--manual-user-presence` and repeat the registration and authentication flows.
+   - Restart the service with `--manual-user-presence` (for example `cargo run -p pc-hid-runner -- start --foreground --manual-user-presence`) and repeat the registration and authentication flows.
    - Ensure prompts wait for CLI confirmation (or whichever manual mechanism is configured) before proceeding.
 
 7. **Shutdown hygiene**
