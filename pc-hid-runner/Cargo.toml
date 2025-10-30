@@ -21,6 +21,9 @@ trussed = { version = "0.1", default-features = false, features = ["log-all", "v
 authenticator = { path = "../authenticator" }
 daemonize = "0.4"
 
+[dev-dependencies]
+ciborium = "0.2"
+
 [dependencies.pc-usbip-runner]
 optional = true
 package = "trussed-usbip"

@@ -129,3 +129,25 @@ ls -l /dev/hidraw*
 
 The CLI warns if `/dev/uhid` is inaccessible or if the hidraw node ends up world-readable,
 prompting you to adjust the rule or group membership.
+
+## Verifying PQC PIN fallback
+
+The authenticator prefers the ML-KEM-based PIN/UV protocol (101) whenever the platform
+supports it, but automatically downgrades to CTAP2 classic PIN handling if the relying
+party declines PQC support. Browsers or WebAuthn clients that have not yet implemented
+the PQC extension continue to operate with the classic protocol, while ML-DSA credential
+registration and assertion flows remain unchanged regardless of the negotiated PIN mode.
+
+Two helper scripts under `tests/integration/` exercise both paths with `libfido2`:
+
+```bash
+# Run with PQC PIN protocol
+sudo tests/integration/pin_flow_pqc.sh /dev/hidrawX 123456
+
+# Force classic PIN protocol to validate fallback
+sudo tests/integration/pin_flow_classic.sh /dev/hidrawX 123456
+```
+
+Replace `/dev/hidrawX` with the node exposed by the runner. Each script provisions (or
+verifies) the chosen PIN protocol using `fido2-token`, ensuring that PQC-capable clients
+negotiate ML-KEM while legacy platforms fall back automatically.
