@@ -27,7 +27,11 @@ use trussed_usbip::{Platform, Store, Syscall};
 #[clap(about, version, author)]
 struct Args {
     /// USB product
-    #[clap(short = 'n', long, default_value = "Feitian FIDO2 Software Authenticator (ML-DSA)")]
+    #[clap(
+        short = 'n',
+        long,
+        default_value = "Feitian FIDO2 Software Authenticator (ML-DSA)"
+    )]
     product: String,
 
     /// USB manufacturer
@@ -53,11 +57,16 @@ struct Args {
     /// Authenticator AAGUID
     #[clap(long, default_value = "4645495449414E980616525A30310000")]
     aaguid: String,
+
+    /// Require user gestures instead of automatically satisfying presence checks
+    #[clap(long)]
+    manual_user_presence: bool,
 }
 
 #[derive(Clone, Copy)]
 struct AppData {
     aaguid: [u8; 16],
+    auto_user_presence: bool,
 }
 
 struct Apps<C: Client> {
@@ -79,6 +88,7 @@ impl<'a> trussed_usbip::Apps<'a, CoreOnly> for Apps<trussed_usbip::Client<CoreOn
         endpoints.push(ServiceEndpoint::new(responder, context, &[]));
         let client = trussed_usbip::Client::new(requester, syscall, None);
         let mut ctap = CtapApp::new(client, data.aaguid);
+        ctap.set_auto_user_presence(data.auto_user_presence);
         ctap.set_keepalive_callback(trussed_usbip::set_waiting);
         Self { ctap }
     }
@@ -150,7 +160,13 @@ fn main() {
     let platform = Platform::new(store);
     trussed_usbip::Builder::new(options)
         .build::<Apps<_>>()
-        .exec(platform, AppData { aaguid });
+        .exec(
+            platform,
+            AppData {
+                aaguid,
+                auto_user_presence: !args.manual_user_presence,
+            },
+        );
 }
 
 #[cfg(test)]
