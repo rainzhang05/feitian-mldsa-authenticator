@@ -1,13 +1,10 @@
-use std::{
-    sync::atomic::Ordering,
-    time::{Duration, Instant},
-};
+use std::time::{Duration, Instant};
 
 use ctaphid_dispatch::Dispatch;
 use usb_device::bus::{UsbBus, UsbBusAllocator};
 use usbd_ctaphid::{types::Status, CtapHid};
 
-use super::{Timeout, IS_WAITING};
+use transport_core::Timeout;
 
 pub fn setup<'bus, 'pipe, 'interrupt, B: UsbBus, const N: usize>(
     bus_allocator: &'bus UsbBusAllocator<B>,
@@ -29,10 +26,11 @@ pub fn keepalive<B: UsbBus, const N: usize>(
     ctaphid: &mut CtapHid<'_, '_, '_, B, N>,
     timeout: &mut Timeout,
     epoch: Instant,
-) {
+    waiting_for_user: bool,
+) -> bool {
     timeout.update(epoch, map_status(ctaphid.did_start_processing()), || {
-        map_status(ctaphid.send_keepalive(IS_WAITING.load(Ordering::Relaxed)))
-    });
+        map_status(ctaphid.send_keepalive(waiting_for_user))
+    })
 }
 
 fn map_status(status: Status) -> Option<Duration> {
