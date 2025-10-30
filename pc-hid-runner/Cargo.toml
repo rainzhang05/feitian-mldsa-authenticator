@@ -1,0 +1,10 @@
+[package]
+name = "pc-hid-runner"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+nix = { version = "0.27", default-features = false, features = ["fs", "poll", "signal"] }
+serde = { version = "1", features = ["derive"] }
+signal-hook = { version = "0.3", features = ["iterator"] }
+tokio = { version = "1", features = ["net", "rt"] }

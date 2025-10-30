@@ -3,7 +3,8 @@ members = [
     "trussed-mldsa",
     "authenticator",
     "trussed-mlkem",
-    "pc-usbip-runner"
+    "pc-usbip-runner",
+    "pc-hid-runner"
 ]
 
 resolver = "2"
