@@ -1,0 +1,20 @@
+[package]
+name = "trussed-host-runner"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+littlefs2-core = "0.1"
+log = { version = "0.4.14", default-features = false }
+rand_chacha = { version = "0.3", default-features = false }
+rand_core = { version = "0.6", features = ["getrandom"] }
+trussed = { version = "0.1", default-features = false, features = ["log-all", "virt"] }
+
+# optional features
+ctaphid-dispatch = { version = "0.3", optional = true, features = ["log-all"] }
+apdu-dispatch = { version = "0.3", optional = true }
+
+[features]
+default = ["ctaphid"]
+ctaphid = ["ctaphid-dispatch"]
+ccid = ["apdu-dispatch"]

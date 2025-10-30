@@ -166,6 +166,7 @@ fn main() {
                 aaguid,
                 auto_user_presence: !args.manual_user_presence,
             },
+            Box::new(trussed_usbip::UsbipTransport),
         );
 }
 
