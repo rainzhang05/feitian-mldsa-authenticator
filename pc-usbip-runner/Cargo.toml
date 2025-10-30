@@ -30,6 +30,7 @@ heapless-bytes = "0.3"
 littlefs2 = "0.6"
 pretty_env_logger = "0.4.0"
 trussed = "0.1"
+authenticator = { path = "../authenticator" }
 
 [features]
 default = ["ctaphid", "ccid"]

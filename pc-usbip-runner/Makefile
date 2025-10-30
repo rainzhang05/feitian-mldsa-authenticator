@@ -1,4 +1,4 @@
-EXAMPLE_NAME := dummy
+EXAMPLE_NAME := authenticator
 
 all: | start-sim attach finish-message
 

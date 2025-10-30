@@ -96,11 +96,10 @@ pub(crate) fn take_waiting_log() -> Vec<bool> {
         .collect()
 }
 
-fn set_keepalive_waiting(waiting: bool) {
-    #[cfg(not(test))]
-    {
-        pc_usbip_runner::set_waiting(waiting);
-    }
+fn noop_keepalive(_: bool) {}
+
+fn set_keepalive_waiting(callback: fn(bool), waiting: bool) {
+    callback(waiting);
 
     #[cfg(test)]
     {
@@ -113,17 +112,21 @@ fn set_keepalive_waiting(waiting: bool) {
 
 struct WaitingState {
     active: bool,
+    callback: fn(bool),
 }
 
 impl WaitingState {
-    fn begin() -> Self {
-        set_keepalive_waiting(true);
-        Self { active: true }
+    fn begin(callback: fn(bool)) -> Self {
+        set_keepalive_waiting(callback, true);
+        Self {
+            active: true,
+            callback,
+        }
     }
 
     fn clear(&mut self) {
         if self.active {
-            set_keepalive_waiting(false);
+            set_keepalive_waiting(self.callback, false);
             self.active = false;
         }
     }
@@ -647,6 +650,7 @@ pub struct CtapApp<C> {
     pending_assertion: Option<PendingAssertion>,
     attestation_private_key: Option<Vec<u8>>,
     attestation_certificate_chain: Option<Vec<Vec<u8>>>,
+    keepalive_callback: fn(bool),
     interrupt_flag: &'static InterruptFlag,
     #[cfg(test)]
     stored_credentials: Vec<StoredCredential>,
@@ -668,6 +672,7 @@ where
             pending_assertion: None,
             attestation_private_key: None,
             attestation_certificate_chain: None,
+            keepalive_callback: noop_keepalive,
             interrupt_flag: Box::leak(Box::new(InterruptFlag::new())),
             #[cfg(test)]
             stored_credentials: Vec::new(),
@@ -678,6 +683,10 @@ where
         }
 
         app
+    }
+
+    pub fn set_keepalive_callback(&mut self, callback: fn(bool)) {
+        self.keepalive_callback = callback;
     }
 
     pub fn suppress_attestation(&mut self, suppress: bool) {
@@ -789,7 +798,7 @@ where
 
     fn await_user_presence(&mut self) -> Result<bool, u8> {
         let _interrupt_guard = InterruptWorkGuard::begin(self.interrupt_flag);
-        let mut waiting = WaitingState::begin();
+        let mut waiting = WaitingState::begin(self.keepalive_callback);
         let mut waited_ms = 0u32;
         loop {
             if self.interrupt_flag.is_interrupted() {
