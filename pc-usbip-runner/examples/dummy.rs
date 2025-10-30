@@ -149,7 +149,7 @@ fn main() {
     let options = trussed_usbip::Options {
         manufacturer: Some("Feitian Technologies Co., Ltd.".to_string()),
         product: Some("Feitian FIDO2 Software Authenticator (ML-DSA)".to_string()),
-        serial_number: Some("FT-PQC-001".to_string()),
+        serial_number: Some("FEITIAN-PQC-001".to_string()),
         vid: 0x1998,
         pid: 0x0616,
         device_class: None,

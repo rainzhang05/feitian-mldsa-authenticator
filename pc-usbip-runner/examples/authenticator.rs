@@ -35,8 +35,8 @@ struct Args {
     manufacturer: String,
 
     /// USB serial number
-    #[clap(long)]
-    serial: Option<String>,
+    #[clap(long, default_value = "FEITIAN-PQC-001")]
+    serial: String,
 
     /// Trussed state file (currently unused, reserved for future persistence)
     #[clap(long, default_value = "trussed-state.bin")]
