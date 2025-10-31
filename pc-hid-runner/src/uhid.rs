@@ -18,7 +18,7 @@ const DEVICE_PATH: &str = "/dev/uhid";
 pub const CTAPHID_FRAME_LEN: usize = 64;
 const BUS_USB: u16 = 0x03;
 
-const FIDO_HID_REPORT_DESCRIPTOR: [u8; 34] = [
+const CTAPHID_REPORT_DESCRIPTOR: [u8; 34] = [
     0x06, 0xD0, 0xF1,       // Usage Page (FIDO Alliance)
     0x09, 0x01,             // Usage (U2F HID Authenticator)
     0xA1, 0x01,             // Collection (Application)
