@@ -387,17 +387,41 @@ fn force_ctaphid_report_descriptor(event: &mut raw::uhid_event) {
 
     let create2 = unsafe { &mut event.u.create2 };
     let size = usize::from(create2.rd_size);
+    let slice_len = size.min(create2.rd_data.len());
     let expected_len = CTAPHID_REPORT_DESCRIPTOR.len();
 
     if size >= expected_len && create2.rd_data[..expected_len] == CTAPHID_REPORT_DESCRIPTOR {
         if size > expected_len {
-            create2.rd_data[expected_len..size].fill(0);
+            let end = size.min(create2.rd_data.len());
+            create2.rd_data[expected_len..end].fill(0);
             create2.rd_size = expected_len as u16;
         }
         return;
     }
 
-    if size == 0 {
+    let mut decoded = [0u8; CTAPHID_REPORT_DESCRIPTOR.len()];
+    if let Some(decoded_len) = decode_ascii_hex_prefix(&create2.rd_data[..slice_len], &mut decoded)
+    {
+        if decoded_len != expected_len {
+            log::warn!(
+                "create2 descriptor decoded {} ASCII hex bytes (expected {}); forcing canonical CTAPHID layout",
+                decoded_len,
+                expected_len
+            );
+        } else if decoded[..expected_len] == CTAPHID_REPORT_DESCRIPTOR {
+            create2.rd_data[..expected_len].copy_from_slice(&decoded);
+            create2.rd_data[expected_len..].fill(0);
+            create2.rd_size = expected_len as u16;
+            return;
+        } else {
+            create2.rd_data[..expected_len].copy_from_slice(&decoded);
+            create2.rd_data[expected_len..].fill(0);
+            create2.rd_size = expected_len as u16;
+            log::warn!(
+                "create2 descriptor decoded from ASCII hex but did not match canonical CTAPHID bytes; forcing expected layout"
+            );
+        }
+    } else if size == 0 {
         log::warn!(
             "create2 descriptor length was zero; forcing {} CTAPHID bytes",
             expected_len
@@ -409,7 +433,7 @@ fn force_ctaphid_report_descriptor(event: &mut raw::uhid_event) {
             raw::HID_MAX_DESCRIPTOR_SIZE,
             expected_len
         );
-    } else if looks_like_ascii_hex(&create2.rd_data[..size]) {
+    } else if looks_like_ascii_hex(&create2.rd_data[..slice_len]) {
         log::warn!(
             "create2 descriptor appeared to be ASCII hex ({} bytes); forcing {} raw bytes",
             size,
@@ -426,6 +450,63 @@ fn force_ctaphid_report_descriptor(event: &mut raw::uhid_event) {
     create2.rd_data[..expected_len].copy_from_slice(&CTAPHID_REPORT_DESCRIPTOR);
     create2.rd_data[expected_len..].fill(0);
     create2.rd_size = expected_len as u16;
+}
+
+fn decode_ascii_hex_prefix(source: &[u8], dest: &mut [u8]) -> Option<usize> {
+    if dest.is_empty() {
+        return Some(0);
+    }
+
+    let mut high_nibble = None;
+    let mut written = 0usize;
+
+    for &byte in source {
+        if byte.is_ascii_whitespace() {
+            continue;
+        }
+
+        match ascii_hex_value(byte) {
+            Some(value) => {
+                if let Some(high) = high_nibble.take() {
+                    if written >= dest.len() {
+                        // Destination buffer is full; ignore any trailing ASCII.
+                        break;
+                    }
+                    dest[written] = (high << 4) | value;
+                    written += 1;
+                    if written >= dest.len() {
+                        break;
+                    }
+                } else {
+                    high_nibble = Some(value);
+                }
+            }
+            None => {
+                if high_nibble.is_some() {
+                    // Saw an odd number of hex digits.
+                    return None;
+                }
+                break;
+            }
+        }
+    }
+
+    if high_nibble.is_some() {
+        None
+    } else if written == 0 {
+        None
+    } else {
+        Some(written)
+    }
+}
+
+fn ascii_hex_value(byte: u8) -> Option<u8> {
+    match byte {
+        b'0'..=b'9' => Some(byte - b'0'),
+        b'a'..=b'f' => Some(byte - b'a' + 10),
+        b'A'..=b'F' => Some(byte - b'A' + 10),
+        _ => None,
+    }
 }
 
 fn to_io_error(err: nix::Error) -> io::Error {
@@ -844,6 +925,31 @@ mod tests {
         };
         let descriptor_bytes = &buffer[data_offset..data_offset + CTAPHID_REPORT_DESCRIPTOR.len()];
         assert_eq!(descriptor_bytes, &CTAPHID_REPORT_DESCRIPTOR);
+    }
+
+    #[test]
+    fn decode_ascii_hex_prefix_matches_descriptor() {
+        let ascii_descriptor = b"06 d0 f1 09 01 a1 01 09 20 15 00 26 ff 00 75 08 95 40 81 02 09 21 15 00 26 ff 00 75 08 95 40 91 02 c0";
+        let mut decoded = [0u8; CTAPHID_REPORT_DESCRIPTOR.len()];
+        let len = decode_ascii_hex_prefix(ascii_descriptor, &mut decoded).expect("decode ascii");
+        assert_eq!(len, CTAPHID_REPORT_DESCRIPTOR.len());
+        assert_eq!(&decoded, &CTAPHID_REPORT_DESCRIPTOR);
+    }
+
+    #[test]
+    fn decode_ascii_hex_prefix_handles_suffix_text() {
+        let ascii_descriptor = b"06 d0 f1 09 01 a1 01 09 20 15 00 26 ff 00 75 08 95 40 81 02 09 21 15 00 26 ff 00 75 08 95 40 91 02 c0  INPUT[INPUT]\n";
+        let mut decoded = [0u8; CTAPHID_REPORT_DESCRIPTOR.len()];
+        let len = decode_ascii_hex_prefix(ascii_descriptor, &mut decoded).expect("decode ascii");
+        assert_eq!(len, CTAPHID_REPORT_DESCRIPTOR.len());
+        assert_eq!(&decoded, &CTAPHID_REPORT_DESCRIPTOR);
+    }
+
+    #[test]
+    fn decode_ascii_hex_prefix_rejects_odd_digit_sequences() {
+        let ascii_descriptor = b"06 d";
+        let mut decoded = [0u8; CTAPHID_REPORT_DESCRIPTOR.len()];
+        assert!(decode_ascii_hex_prefix(ascii_descriptor, &mut decoded).is_none());
     }
 
     #[test]
