@@ -19,8 +19,8 @@ use trussed::backend::Dispatch;
 pub use uhid::{CtapHidFrame, HidDeviceDescriptor, ReportType, UhidDevice, CTAPHID_FRAME_LEN};
 
 // CTAPHID capability flags (CTAP spec section 11.2.9.1.3)
-const CAPABILITY_CBOR: u8 = 0x04; // Implements CTAPHID_CBOR
-const CAPABILITY_NMSG: u8 = 0x08; // Does NOT implement CTAPHID_MSG
+pub const CAPABILITY_CBOR: u8 = 0x04; // Implements CTAPHID_CBOR
+pub const CAPABILITY_NMSG: u8 = 0x08; // Does NOT implement CTAPHID_MSG
 
 pub struct UhidTransport<'pipe, 'interrupt> {
     device: UhidDevice,
