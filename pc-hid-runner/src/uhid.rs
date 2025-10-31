@@ -18,24 +18,10 @@ const DEVICE_PATH: &str = "/dev/uhid";
 pub const CTAPHID_FRAME_LEN: usize = 64;
 const BUS_USB: u16 = 0x03;
 
-const CTAPHID_REPORT_DESCRIPTOR: [u8; 34] = [
-    0x06, 0xD0, 0xF1, // Usage Page (FIDO Alliance)
-    0x09, 0x01, // Usage (U2F HID Authenticator)
-    0xA1, 0x01, // Collection (Application)
-    0x09, 0x20, //   Usage (Input Report Data)
-    0x15, 0x00, //   Logical Minimum (0)
-    0x26, 0xFF, 0x00, //   Logical Maximum (255)
-    0x75, 0x08, //   Report Size (8 bits)
-    0x95, 0x40, //   Report Count (64 bytes)
-    0x81, 0x02, //   Input (Data, Variable, Absolute)
-    0x09, 0x21, //   Usage (Output Report Data)
-    0x15, 0x00, //   Logical Minimum (0)
-    0x26, 0xFF, 0x00, //   Logical Maximum (255)
-    0x75, 0x08, //   Report Size (8 bits)
-    0x95, 0x40, //   Report Count (64 bytes)
-    0x91, 0x02, //   Output (Data, Variable, Absolute)
-    0xC0, // End Collection
-];
+// HID report descriptor describing a CTAPHID/FIDO2 authenticator. The descriptor is
+// stored as hex so we can verify and decode it before handing it to the kernel.
+const CTAPHID_REPORT_DESCRIPTOR_HEX: &str =
+    "06 d0 f1 09 01 a1 01 09 20 15 00 26 ff 00 75 08 95 40 81 02 09 21 15 00 26 ff 00 75 08 95 40 91 02 c0";
 const FIDO_HID_REPORT_DESCRIPTOR_LENGTH: usize = 34;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -299,7 +285,9 @@ impl Drop for UhidInner {
 }
 
 fn descriptor_to_create2(descriptor: &HidDeviceDescriptor) -> io::Result<raw::uhid_create2_req> {
-    if CTAPHID_REPORT_DESCRIPTOR.len() > raw::HID_MAX_DESCRIPTOR_SIZE {
+    let descriptor_bytes = parse_ctaphid_report_descriptor()?;
+
+    if descriptor_bytes.len() > raw::HID_MAX_DESCRIPTOR_SIZE {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
             "report descriptor too large",
@@ -308,14 +296,41 @@ fn descriptor_to_create2(descriptor: &HidDeviceDescriptor) -> io::Result<raw::uh
 
     let mut req = raw::uhid_create2_req::default();
     copy_str_to_array(&descriptor.name, &mut req.name);
-    req.rd_size = CTAPHID_REPORT_DESCRIPTOR.len() as u16;
+    req.rd_size = descriptor_bytes.len() as u16;
     req.bus = BUS_USB;
     req.vendor = descriptor.vendor_id;
     req.product = descriptor.product_id;
     req.version = descriptor.version;
     req.country = descriptor.country;
-    req.rd_data[..CTAPHID_REPORT_DESCRIPTOR.len()].copy_from_slice(&CTAPHID_REPORT_DESCRIPTOR);
+    req.rd_data[..descriptor_bytes.len()].copy_from_slice(descriptor_bytes.as_ref());
     Ok(req)
+}
+
+fn parse_ctaphid_report_descriptor() -> io::Result<[u8; FIDO_HID_REPORT_DESCRIPTOR_LENGTH]> {
+    let mut out = [0u8; FIDO_HID_REPORT_DESCRIPTOR_LENGTH];
+    let mut idx = 0;
+    for token in CTAPHID_REPORT_DESCRIPTOR_HEX.split_whitespace() {
+        if idx >= out.len() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "report descriptor contains too many bytes",
+            ));
+        }
+        out[idx] = u8::from_str_radix(token, 16).map_err(|err| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("invalid hex byte '{token}' in report descriptor: {err}"),
+            )
+        })?;
+        idx += 1;
+    }
+    if idx != FIDO_HID_REPORT_DESCRIPTOR_LENGTH {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("expected {FIDO_HID_REPORT_DESCRIPTOR_LENGTH} descriptor bytes, found {idx}"),
+        ));
+    }
+    Ok(out)
 }
 
 fn copy_str_to_array(value: &str, dest: &mut [u8]) {
@@ -624,5 +639,16 @@ mod tests {
         prefixed[0] = 1;
 
         assert!(frame_from_report_slice(&prefixed).is_none());
+    }
+
+    #[test]
+    fn ctaphid_descriptor_matches_expected_bytes() {
+        let descriptor = super::parse_ctaphid_report_descriptor().expect("descriptor parsed");
+        let expected: [u8; super::FIDO_HID_REPORT_DESCRIPTOR_LENGTH] = [
+            0x06, 0xD0, 0xF1, 0x09, 0x01, 0xA1, 0x01, 0x09, 0x20, 0x15, 0x00, 0x26, 0xFF, 0x00,
+            0x75, 0x08, 0x95, 0x40, 0x81, 0x02, 0x09, 0x21, 0x15, 0x00, 0x26, 0xFF, 0x00, 0x75,
+            0x08, 0x95, 0x40, 0x91, 0x02, 0xC0,
+        ];
+        assert_eq!(descriptor, expected);
     }
 }
