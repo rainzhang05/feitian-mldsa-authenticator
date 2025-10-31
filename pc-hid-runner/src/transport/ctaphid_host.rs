@@ -3,6 +3,7 @@ use std::{
     convert::TryInto,
 };
 
+use log::{debug, info, warn};
 use rand::{rngs::OsRng, CryptoRng, RngCore};
 
 use crate::uhid::{CtapHidFrame, CTAPHID_FRAME_LEN};
@@ -14,6 +15,10 @@ use heapless_bytes::Bytes;
 use interchange::State as InterchangeState;
 
 const PACKET_SIZE: usize = CTAPHID_FRAME_LEN;
+const LOG_PREVIEW: usize = 8;
+const CTAP_STATUS_OK: u8 = 0x00;
+const CBOR_CMD_GET_INFO: u8 = 0x04;
+const DEFAULT_MAX_MSG_SIZE: u16 = 1200;
 const CHANNEL_GENERATION_RETRY_LIMIT: usize = 64;
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -186,6 +191,16 @@ where
             };
 
             let length = u16::from_be_bytes(packet[5..7].try_into().unwrap());
+            let preview_len = usize::min(
+                length as usize,
+                usize::min(LOG_PREVIEW, packet.len().saturating_sub(7)),
+            );
+            debug!(
+                "RX init cid={channel:08x} cmd=0x{command_number:02x} ({:?}) len={} preview={:02x?}",
+                command,
+                length,
+                &packet[7..7 + preview_len]
+            );
             let request = Request {
                 channel,
                 command,
@@ -258,6 +273,12 @@ where
                     }
 
                     if message.transmitted + (PACKET_SIZE - 5) < payload_length {
+                        let preview_len = LOG_PREVIEW.min(PACKET_SIZE - 5);
+                        debug!(
+                            "RX cont cid={channel:08x} seq={} preview={:02x?}",
+                            sequence,
+                            &packet[5..5 + preview_len]
+                        );
                         self.buffer[message.transmitted..message.transmitted + PACKET_SIZE - 5]
                             .copy_from_slice(&packet[5..]);
                         message.absorb_packet();
@@ -439,7 +460,23 @@ where
             return;
         }
 
-        let payload = &self.buffer[..request.length as usize];
+        let payload_len = request.length as usize;
+        if let Some(result) = self.try_handle_builtin(request, payload_len) {
+            match result {
+                Ok(len) => {
+                    let response = Response::from_request_and_size(request, len);
+                    self.enqueue_response(response);
+                }
+                Err(error) => {
+                    self.start_sending_error(request, error);
+                }
+            }
+            self.state = State::Idle;
+            self.started_processing = true;
+            self.needs_keepalive = false;
+            return;
+        }
+        let payload = &self.buffer[..payload_len];
         match Bytes::<N>::from_slice(payload) {
             Ok(bytes) => {
                 if matches!(self.requester.state(), InterchangeState::Responded) {
@@ -481,6 +518,13 @@ where
 
         let first_copy = remaining.min(PACKET_SIZE - 7);
         frame[7..7 + first_copy].copy_from_slice(&self.buffer[..first_copy]);
+        debug!(
+            "TX init cid={:08x} cmd=0x{:02x} len={} preview={:02x?}",
+            response.channel,
+            response.command.into_u8(),
+            response.length,
+            &self.buffer[..usize::min(first_copy, LOG_PREVIEW)]
+        );
         remaining -= first_copy;
         offset += first_copy;
         self.pending.push_back(CtapHidFrame::new(frame));
@@ -493,6 +537,13 @@ where
             sequence = sequence.wrapping_add(1);
             let chunk = remaining.min(PACKET_SIZE - 5);
             cont[5..5 + chunk].copy_from_slice(&self.buffer[offset..offset + chunk]);
+            debug!(
+                "TX cont cid={:08x} seq={} chunk_len={} preview={:02x?}",
+                response.channel,
+                sequence.wrapping_sub(1),
+                chunk,
+                &self.buffer[offset..offset + usize::min(chunk, LOG_PREVIEW)]
+            );
             self.pending.push_back(CtapHidFrame::new(cont));
             offset += chunk;
             remaining -= chunk;
@@ -519,6 +570,10 @@ where
         frame[4] = Command::KeepAlive.into_u8() | 0x80;
         frame[5..7].copy_from_slice(&1u16.to_be_bytes());
         frame[7] = status as u8;
+        debug!(
+            "TX keepalive cid={channel:08x} status=0x{:02x}",
+            status as u8
+        );
         self.pending.push_back(CtapHidFrame::new(frame));
     }
 
@@ -533,6 +588,75 @@ where
             }
         }
         Err(AuthenticatorError::ChannelBusy)
+    }
+
+    fn try_handle_builtin(
+        &mut self,
+        request: Request,
+        payload_len: usize,
+    ) -> Option<Result<usize, AuthenticatorError>> {
+        match request.command {
+            Command::Cbor => self.handle_builtin_cbor(payload_len),
+            _ => None,
+        }
+    }
+
+    fn handle_builtin_cbor(
+        &mut self,
+        payload_len: usize,
+    ) -> Option<Result<usize, AuthenticatorError>> {
+        if payload_len == 0 {
+            warn!("CBOR request missing subcommand");
+            return Some(Err(AuthenticatorError::InvalidLength));
+        }
+        match self.buffer[0] {
+            CBOR_CMD_GET_INFO => {
+                let len = self.write_get_info_response();
+                info!("CBOR getInfo -> OK ({} bytes)", len);
+                Some(Ok(len))
+            }
+            _ => None,
+        }
+    }
+
+    fn write_get_info_response(&mut self) -> usize {
+        let mut offset = 0usize;
+        self.buffer[offset] = CTAP_STATUS_OK;
+        offset += 1;
+        // Map with four entries
+        self.buffer[offset] = 0xA4;
+        offset += 1;
+        // versions: ["FIDO_2_0"]
+        self.buffer[offset] = 0x01;
+        offset += 1;
+        self.buffer[offset] = 0x81;
+        offset += 1;
+        self.buffer[offset] = 0x68; // text length 8
+        offset += 1;
+        self.buffer[offset..offset + 8].copy_from_slice(b"FIDO_2_0");
+        offset += 8;
+        // aaguid: 16 zero bytes
+        self.buffer[offset] = 0x03;
+        offset += 1;
+        self.buffer[offset] = 0x50; // byte string length 16
+        offset += 1;
+        self.buffer[offset..offset + 16].fill(0);
+        offset += 16;
+        // maxMsgSize: DEFAULT_MAX_MSG_SIZE
+        self.buffer[offset] = 0x05;
+        offset += 1;
+        self.buffer[offset] = 0x19;
+        offset += 1;
+        self.buffer[offset..offset + 2].copy_from_slice(&DEFAULT_MAX_MSG_SIZE.to_be_bytes());
+        offset += 2;
+        // pinProtocols: [1]
+        self.buffer[offset] = 0x06;
+        offset += 1;
+        self.buffer[offset] = 0x81;
+        offset += 1;
+        self.buffer[offset] = 0x01;
+        offset += 1;
+        offset
     }
 }
 
