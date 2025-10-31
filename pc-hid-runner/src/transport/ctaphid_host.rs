@@ -497,6 +497,10 @@ mod tests {
     use super::*;
     use ctaphid_dispatch::{app::App, Channel, Dispatch, DEFAULT_MESSAGE_SIZE};
 
+    // CTAPHID capability flags (CTAP spec section 11.2.9.1.3)
+    const CAPABILITY_CBOR: u8 = 0x04; // Implements CTAPHID_CBOR
+    const CAPABILITY_NMSG: u8 = 0x08; // Does NOT implement CTAPHID_MSG
+
     struct EchoApp;
 
     impl<'interrupt, const N: usize> App<'interrupt, N> for EchoApp {
@@ -538,8 +542,7 @@ mod tests {
     #[test]
     fn handles_init() {
         let (mut host, mut dispatch, mut app) = init_host();
-        // CAPABILITY_CBOR (0x04) | CAPABILITY_NMSG (0x08) = 0x0C
-        host.set_capabilities(0x0C);
+        host.set_capabilities(CAPABILITY_CBOR | CAPABILITY_NMSG);
 
         let mut init_packet = [0u8; 64];
         init_packet[..4].copy_from_slice(&0xffffffffu32.to_be_bytes());
@@ -555,8 +558,8 @@ mod tests {
         assert_eq!(frames[0][4] & 0x7f, Command::Init.into_u8());
         assert_eq!(frames[0][5..7], [0, 17]);
         assert_eq!(&frames[0][7..15], &[1, 2, 3, 4, 5, 6, 7, 8]);
-        // Verify CAPABILITY_CBOR (0x04) | CAPABILITY_NMSG (0x08) = 0x0C
-        assert_eq!(frames[0][16], 0x0C);
+        // Verify CAPABILITY_CBOR | CAPABILITY_NMSG = 0x0C
+        assert_eq!(frames[0][16], CAPABILITY_CBOR | CAPABILITY_NMSG);
     }
 
     #[test]

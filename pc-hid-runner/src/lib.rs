@@ -18,6 +18,10 @@ pub use transport_core::{
 use trussed::backend::Dispatch;
 pub use uhid::{CtapHidFrame, HidDeviceDescriptor, ReportType, UhidDevice, CTAPHID_FRAME_LEN};
 
+// CTAPHID capability flags (CTAP spec section 11.2.9.1.3)
+const CAPABILITY_CBOR: u8 = 0x04; // Implements CTAPHID_CBOR
+const CAPABILITY_NMSG: u8 = 0x08; // Does NOT implement CTAPHID_MSG
+
 pub struct UhidTransport<'pipe, 'interrupt> {
     device: UhidDevice,
     host: CtaphidHost<'pipe, { DEFAULT_MESSAGE_SIZE }>,
@@ -135,10 +139,8 @@ where
         minor: 1,
         build: 0,
     });
-    // CAPABILITY_CBOR (0x04): Implements CTAPHID_CBOR
-    // CAPABILITY_NMSG (0x08): Does NOT implement CTAPHID_MSG
-    // Setting both bits prevents hosts from probing CTAPHID_MSG and enables proper CTAP2 detection
-    host.set_capabilities(0x0C);
+    // Setting both capability bits prevents hosts from probing CTAPHID_MSG and enables proper CTAP2 detection
+    host.set_capabilities(CAPABILITY_CBOR | CAPABILITY_NMSG);
     let dispatch = ctaphid_dispatch::Dispatch::new(responder);
     let transport = UhidTransport::new(device, host, dispatch);
     runner.exec(platform, data, transport)
