@@ -135,7 +135,7 @@ where
         minor: 1,
         build: 0,
     });
-    host.set_capabilities(0x02);
+    host.set_capabilities(0x04);
     let dispatch = ctaphid_dispatch::Dispatch::new(responder);
     let transport = UhidTransport::new(device, host, dispatch);
     runner.exec(platform, data, transport)
