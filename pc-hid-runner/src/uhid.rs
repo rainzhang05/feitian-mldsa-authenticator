@@ -19,25 +19,22 @@ pub const CTAPHID_FRAME_LEN: usize = 64;
 const BUS_USB: u16 = 0x03;
 
 const CTAPHID_REPORT_DESCRIPTOR: [u8; 34] = [
-    0x06, 0xD0, 0xF1,       // Usage Page (FIDO Alliance)
-    0x09, 0x01,             // Usage (U2F HID Authenticator)
-    0xA1, 0x01,             // Collection (Application)
-
-    0x09, 0x20,             //   Usage (Input Report Data)
-    0x15, 0x00,             //   Logical Minimum (0)
-    0x26, 0xFF, 0x00,       //   Logical Maximum (255)
-    0x75, 0x08,             //   Report Size (8 bits)
-    0x95, 0x40,             //   Report Count (64 bytes)
-    0x81, 0x02,             //   Input (Data, Variable, Absolute)
-
-    0x09, 0x21,             //   Usage (Output Report Data)
-    0x15, 0x00,             //   Logical Minimum (0)
-    0x26, 0xFF, 0x00,       //   Logical Maximum (255)
-    0x75, 0x08,             //   Report Size (8 bits)
-    0x95, 0x40,             //   Report Count (64 bytes)
-    0x91, 0x02,             //   Output (Data, Variable, Absolute)
-
-    0xC0                    // End Collection
+    0x06, 0xD0, 0xF1, // Usage Page (FIDO Alliance)
+    0x09, 0x01, // Usage (U2F HID Authenticator)
+    0xA1, 0x01, // Collection (Application)
+    0x09, 0x20, //   Usage (Input Report Data)
+    0x15, 0x00, //   Logical Minimum (0)
+    0x26, 0xFF, 0x00, //   Logical Maximum (255)
+    0x75, 0x08, //   Report Size (8 bits)
+    0x95, 0x40, //   Report Count (64 bytes)
+    0x81, 0x02, //   Input (Data, Variable, Absolute)
+    0x09, 0x21, //   Usage (Output Report Data)
+    0x15, 0x00, //   Logical Minimum (0)
+    0x26, 0xFF, 0x00, //   Logical Maximum (255)
+    0x75, 0x08, //   Report Size (8 bits)
+    0x95, 0x40, //   Report Count (64 bytes)
+    0x91, 0x02, //   Output (Data, Variable, Absolute)
+    0xC0, // End Collection
 ];
 const FIDO_HID_REPORT_DESCRIPTOR_LENGTH: usize = 34;
 
@@ -95,6 +92,22 @@ impl ReportType {
     }
 }
 
+fn frame_from_report_slice(slice: &[u8]) -> Option<CtapHidFrame> {
+    match slice.len() {
+        CTAPHID_FRAME_LEN => {
+            let mut data = [0u8; CTAPHID_FRAME_LEN];
+            data.copy_from_slice(&slice[..CTAPHID_FRAME_LEN]);
+            Some(CtapHidFrame::new(data))
+        }
+        len if len == CTAPHID_FRAME_LEN + 1 && slice.first().copied() == Some(0) => {
+            let mut data = [0u8; CTAPHID_FRAME_LEN];
+            data.copy_from_slice(&slice[1..1 + CTAPHID_FRAME_LEN]);
+            Some(CtapHidFrame::new(data))
+        }
+        _ => None,
+    }
+}
+
 pub struct UhidDevice {
     inner: Arc<UhidInner>,
     descriptor: HidDeviceDescriptor,
@@ -141,12 +154,10 @@ impl UhidDevice {
                         ) {
                             continue;
                         }
-                        if size == CTAPHID_FRAME_LEN {
-                            let mut data = [0u8; CTAPHID_FRAME_LEN];
-                            unsafe {
-                                data.copy_from_slice(&event.u.output.data[..CTAPHID_FRAME_LEN]);
-                            }
-                            return Ok(Some(CtapHidFrame::new(data)));
+                        if let Some(frame) =
+                            unsafe { frame_from_report_slice(&event.u.output.data[..size]) }
+                        {
+                            return Ok(Some(frame));
                         }
                     }
                     raw::UHID_EVENT_TYPE_SET_REPORT => {
@@ -165,12 +176,10 @@ impl UhidDevice {
                         if status != 0 {
                             continue;
                         }
-                        if size == CTAPHID_FRAME_LEN {
-                            let mut data = [0u8; CTAPHID_FRAME_LEN];
-                            unsafe {
-                                data.copy_from_slice(&event.u.set_report.data[..CTAPHID_FRAME_LEN]);
-                            }
-                            return Ok(Some(CtapHidFrame::new(data)));
+                        if let Some(frame) =
+                            unsafe { frame_from_report_slice(&event.u.set_report.data[..size]) }
+                        {
+                            return Ok(Some(frame));
                         }
                     }
                     raw::UHID_EVENT_TYPE_GET_REPORT => {
@@ -241,10 +250,9 @@ impl UhidInner {
     fn send_input_report(&self, data: &[u8; CTAPHID_FRAME_LEN]) -> io::Result<()> {
         let mut event = raw::uhid_event::default();
         event.type_ = raw::UHID_EVENT_TYPE_INPUT2;
-        unsafe {
-            event.u.input2.size = CTAPHID_FRAME_LEN as u16;
-            event.u.input2.data[..CTAPHID_FRAME_LEN].copy_from_slice(data);
-        }
+        let input = unsafe { &mut event.u.input2 };
+        input.size = CTAPHID_FRAME_LEN as u16;
+        input.data[..CTAPHID_FRAME_LEN].copy_from_slice(data);
         write_event_blocking(self.fd.as_raw_fd(), &event)
     }
 
@@ -257,22 +265,20 @@ impl UhidInner {
         }
         let mut event = raw::uhid_event::default();
         event.type_ = raw::UHID_EVENT_TYPE_GET_REPORT_REPLY;
-        unsafe {
-            event.u.get_report_reply.id = id;
-            event.u.get_report_reply.err = err;
-            event.u.get_report_reply.size = data.len() as u16;
-            event.u.get_report_reply.data[..data.len()].copy_from_slice(data);
-        }
+        let reply = unsafe { &mut event.u.get_report_reply };
+        reply.id = id;
+        reply.err = err;
+        reply.size = data.len() as u16;
+        reply.data[..data.len()].copy_from_slice(data);
         write_event_blocking(self.fd.as_raw_fd(), &event)
     }
 
     fn send_set_report_reply(&self, id: u32, err: u16) -> io::Result<()> {
         let mut event = raw::uhid_event::default();
         event.type_ = raw::UHID_EVENT_TYPE_SET_REPORT_REPLY;
-        unsafe {
-            event.u.set_report_reply.id = id;
-            event.u.set_report_reply.err = err;
-        }
+        let reply = unsafe { &mut event.u.set_report_reply };
+        reply.id = id;
+        reply.err = err;
         write_event_blocking(self.fd.as_raw_fd(), &event)
     }
 
@@ -557,5 +563,66 @@ mod raw {
 
     pub fn event_from_bytes(bytes: &[u8; UHID_EVENT_SIZE]) -> uhid_event {
         unsafe { core::ptr::read(bytes.as_ptr() as *const uhid_event) }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ctaphid_dispatch::app::Command;
+
+    fn init_frame() -> [u8; CTAPHID_FRAME_LEN] {
+        let mut frame = [0u8; CTAPHID_FRAME_LEN];
+        frame[..4].copy_from_slice(&0xffff_ffffu32.to_be_bytes());
+        frame[4] = Command::Init.into_u8() | 0x80;
+        frame[5..7].copy_from_slice(&(8u16).to_be_bytes());
+        frame[7..15].copy_from_slice(&[1, 2, 3, 4, 5, 6, 7, 8]);
+        frame
+    }
+
+    fn ping_frame() -> [u8; CTAPHID_FRAME_LEN] {
+        let mut frame = [0u8; CTAPHID_FRAME_LEN];
+        frame[..4].copy_from_slice(&0x0102_0304u32.to_be_bytes());
+        frame[4] = Command::Ping.into_u8() | 0x80;
+        frame[5..7].copy_from_slice(&(16u16).to_be_bytes());
+        for (idx, byte) in frame[7..23].iter_mut().enumerate() {
+            *byte = idx as u8;
+        }
+        frame
+    }
+
+    fn with_leading_zero(frame: [u8; CTAPHID_FRAME_LEN]) -> [u8; CTAPHID_FRAME_LEN + 1] {
+        let mut out = [0u8; CTAPHID_FRAME_LEN + 1];
+        out[1..].copy_from_slice(&frame);
+        out
+    }
+
+    #[test]
+    fn accepts_prefixed_init_report() {
+        let frame = init_frame();
+        let prefixed = with_leading_zero(frame);
+
+        let parsed = frame_from_report_slice(&prefixed).expect("frame not parsed");
+        assert_eq!(parsed.as_bytes(), &init_frame());
+
+        let parsed_without_prefix = frame_from_report_slice(&frame).expect("64-byte frame");
+        assert_eq!(parsed_without_prefix.as_bytes(), &init_frame());
+    }
+
+    #[test]
+    fn accepts_prefixed_ping_report() {
+        let frame = ping_frame();
+        let prefixed = with_leading_zero(frame);
+
+        let parsed = frame_from_report_slice(&prefixed).expect("frame not parsed");
+        assert_eq!(parsed.as_bytes(), &ping_frame());
+    }
+
+    #[test]
+    fn rejects_nonzero_report_id_prefix() {
+        let mut prefixed = with_leading_zero(init_frame());
+        prefixed[0] = 1;
+
+        assert!(frame_from_report_slice(&prefixed).is_none());
     }
 }
