@@ -308,7 +308,8 @@ fn descriptor_to_create2(descriptor: &HidDeviceDescriptor) -> io::Result<raw::uh
     copy_str_to_array(&descriptor.name, &mut req.name);
     req.rd_size = CTAPHID_REPORT_DESCRIPTOR.len() as u16;
 
-    log::debug!("create2 rd_size={} (expected={})", req.rd_size, CTAPHID_REPORT_DESCRIPTOR.len() as u16);
+    let rd_size: u16 = unsafe { core::ptr::read_unaligned(&req.rd_size) };
+    log::debug!("create2 rd_size={} (expected={})", rd_size, CTAPHID_REPORT_DESCRIPTOR.len() as u16);
     req.bus = BUS_USB;
     req.vendor = descriptor.vendor_id;
     req.product = descriptor.product_id;
