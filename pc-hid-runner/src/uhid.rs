@@ -625,4 +625,63 @@ mod tests {
 
         assert!(frame_from_report_slice(&prefixed).is_none());
     }
+
+    #[test]
+    fn descriptor_bytes_are_copied_verbatim() {
+        let descriptor = HidDeviceDescriptor::default();
+        let req = descriptor_to_create2(&descriptor).expect("descriptor conversion");
+
+        assert_eq!(
+            &req.rd_data[..CTAPHID_REPORT_DESCRIPTOR.len()],
+            &CTAPHID_REPORT_DESCRIPTOR
+        );
+
+        let mut event = raw::uhid_event::default();
+        event.type_ = raw::UHID_EVENT_TYPE_CREATE2;
+        event.u.create2 = req;
+
+        let bytes = event_as_bytes(&event);
+        let data_offset = unsafe {
+            let base = (&event as *const raw::uhid_event).cast::<u8>();
+            let data = event.u.create2.rd_data.as_ptr();
+            data.offset_from(base) as usize
+        };
+        let descriptor_bytes = &bytes[data_offset..data_offset + CTAPHID_REPORT_DESCRIPTOR.len()];
+        assert_eq!(descriptor_bytes, &CTAPHID_REPORT_DESCRIPTOR);
+    }
+
+    #[test]
+    fn write_event_sends_raw_descriptor_bytes() {
+        use nix::unistd::{close, pipe, read};
+
+        let descriptor = HidDeviceDescriptor::default();
+        let create2 = descriptor_to_create2(&descriptor).expect("descriptor conversion");
+        let mut event = raw::uhid_event::default();
+        event.type_ = raw::UHID_EVENT_TYPE_CREATE2;
+        event.u.create2 = create2;
+
+        let (read_fd, write_fd) = pipe().expect("pipe");
+        write_event_blocking(write_fd, &event).expect("write_event");
+        close(write_fd).ok();
+
+        let mut buffer = [0u8; raw::UHID_EVENT_SIZE];
+        let mut offset = 0;
+        while offset < buffer.len() {
+            let read_bytes = read(read_fd, &mut buffer[offset..]).expect("read");
+            if read_bytes == 0 {
+                break;
+            }
+            offset += read_bytes;
+        }
+        close(read_fd).ok();
+        assert_eq!(offset, raw::UHID_EVENT_SIZE);
+
+        let data_offset = unsafe {
+            let base = (&event as *const raw::uhid_event).cast::<u8>();
+            let data = event.u.create2.rd_data.as_ptr();
+            data.offset_from(base) as usize
+        };
+        let descriptor_bytes = &buffer[data_offset..data_offset + CTAPHID_REPORT_DESCRIPTOR.len()];
+        assert_eq!(descriptor_bytes, &CTAPHID_REPORT_DESCRIPTOR);
+    }
 }
