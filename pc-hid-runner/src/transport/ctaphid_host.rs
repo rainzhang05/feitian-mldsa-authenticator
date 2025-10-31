@@ -1,6 +1,7 @@
 use std::{
     collections::{HashSet, VecDeque},
     convert::TryInto,
+    fmt,
 };
 
 use log::{debug, info, warn};
@@ -20,11 +21,15 @@ const CTAP_STATUS_OK: u8 = 0x00;
 const CBOR_CMD_GET_INFO: u8 = 0x04;
 const DEFAULT_MAX_MSG_SIZE: u16 = 1200;
 const CBOR_CMD_CLIENT_PIN: u8 = 0x06;
+const CBOR_CMD_BIO_ENROLLMENT: u8 = 0x40;
 const CLIENT_PIN_KEY_SUBCOMMAND: u8 = 0x01;
 const CLIENT_PIN_KEY_PIN_PROTOCOL: u8 = 0x02;
 const CLIENT_PIN_SUBCMD_GET_RETRIES: u8 = 0x01;
+const CLIENT_PIN_SUBCMD_GET_UV_RETRIES: u8 = 0x07;
+const CTAP1_ERR_INVALID_COMMAND: u8 = 0x01;
+const CTAP2_ERR_INVALID_PARAMETER: u8 = 0x02;
 const CTAP2_ERR_INVALID_CBOR: u8 = 0x12;
-const CTAP2_ERR_PIN_AUTH_INVALID: u8 = 0x34;
+const CTAP2_ERR_UNSUPPORTED_OPTION: u8 = 0x2B;
 const CTAP2_ERR_PIN_NOT_SET: u8 = 0x36;
 const CLIENT_PIN_DEFAULT_RETRIES: u8 = 8;
 const CHANNEL_GENERATION_RETRY_LIMIT: usize = 64;
@@ -89,6 +94,26 @@ impl MessageState {
         self.next_sequence = self.next_sequence.wrapping_add(1);
         self.transmitted += PACKET_SIZE - 5;
     }
+}
+
+#[derive(Copy, Clone)]
+struct HexOption(Option<u8>);
+
+impl fmt::Display for HexOption {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self.0 {
+            Some(value) => write!(f, "0x{value:02x}"),
+            None => write!(f, "n/a"),
+        }
+    }
+}
+
+#[derive(Copy, Clone, Default)]
+struct CborResponseInfo {
+    len: usize,
+    status: u8,
+    sub_command: Option<u8>,
+    pin_protocol: Option<u8>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -609,6 +634,18 @@ where
         }
     }
 
+    fn log_cbor_response(&self, cmd: u8, request_bcnt: usize, response: CborResponseInfo) {
+        info!(
+            "CBOR cmd=0x{cmd:02x} status=0x{:02x} sub={} pinProtocol={} req_bcnt={} resp_bcnt={} resp_payload_len={}",
+            response.status,
+            HexOption(response.sub_command),
+            HexOption(response.pin_protocol),
+            request_bcnt,
+            response.len,
+            response.len,
+        );
+    }
+
     fn handle_builtin_cbor(
         &mut self,
         payload_len: usize,
@@ -620,23 +657,25 @@ where
         match self.buffer[0] {
             CBOR_CMD_GET_INFO => {
                 let len = self.write_get_info_response();
-                info!("CBOR getInfo -> OK ({} bytes)", len);
-                Some(Ok(len))
+                let response = CborResponseInfo {
+                    len,
+                    status: CTAP_STATUS_OK,
+                    sub_command: None,
+                    pin_protocol: None,
+                };
+                self.log_cbor_response(CBOR_CMD_GET_INFO, payload_len, response);
+                Some(Ok(response.len))
             }
-            CBOR_CMD_CLIENT_PIN => match self.write_client_pin_response(payload_len) {
-                Ok(len) => {
-                    info!("CBOR ClientPIN getRetries -> OK ({} bytes)", len);
-                    Some(Ok(len))
-                }
-                Err(status) => {
-                    let len = self.write_status_only_response(status);
-                    info!(
-                        "CBOR ClientPIN request unsupported -> CTAP2 status 0x{:02x}",
-                        status
-                    );
-                    Some(Ok(len))
-                }
-            },
+            CBOR_CMD_CLIENT_PIN => {
+                let response = self.write_client_pin_response(payload_len);
+                self.log_cbor_response(CBOR_CMD_CLIENT_PIN, payload_len, response);
+                Some(Ok(response.len))
+            }
+            CBOR_CMD_BIO_ENROLLMENT => {
+                let response = self.write_bio_enrollment_response(payload_len);
+                self.log_cbor_response(CBOR_CMD_BIO_ENROLLMENT, payload_len, response);
+                Some(Ok(response.len))
+            }
             _ => None,
         }
     }
@@ -645,8 +684,8 @@ where
         let mut offset = 0usize;
         self.buffer[offset] = CTAP_STATUS_OK;
         offset += 1;
-        // Map with four entries
-        self.buffer[offset] = 0xA4;
+        // Map with five entries
+        self.buffer[offset] = 0xA5;
         offset += 1;
         // versions: ["FIDO_2_0"]
         self.buffer[offset] = 0x01;
@@ -664,6 +703,23 @@ where
         offset += 1;
         self.buffer[offset..offset + 16].fill(0);
         offset += 16;
+        // options: {"clientPin": true, "uv": false}
+        self.buffer[offset] = 0x04;
+        offset += 1;
+        self.buffer[offset] = 0xA2;
+        offset += 1;
+        self.buffer[offset] = 0x69; // text length 9
+        offset += 1;
+        self.buffer[offset..offset + 9].copy_from_slice(b"clientPin");
+        offset += 9;
+        self.buffer[offset] = 0xF5; // true
+        offset += 1;
+        self.buffer[offset] = 0x62; // text length 2
+        offset += 1;
+        self.buffer[offset..offset + 2].copy_from_slice(b"uv");
+        offset += 2;
+        self.buffer[offset] = 0xF4; // false
+        offset += 1;
         // maxMsgSize: DEFAULT_MAX_MSG_SIZE
         self.buffer[offset] = 0x05;
         offset += 1;
@@ -681,37 +737,103 @@ where
         offset
     }
 
-    fn write_client_pin_response(&mut self, payload_len: usize) -> Result<usize, u8> {
+    fn write_bio_enrollment_response(&mut self, payload_len: usize) -> CborResponseInfo {
+        let (sub_command, pin_protocol) = self.extract_subcommand_for_logging(payload_len);
+        let status = CTAP1_ERR_INVALID_COMMAND;
+        let len = self.write_status_only_response(status);
+        CborResponseInfo {
+            len,
+            status,
+            sub_command,
+            pin_protocol,
+        }
+    }
+
+    fn extract_subcommand_for_logging(&self, payload_len: usize) -> (Option<u8>, Option<u8>) {
         if payload_len < 2 {
-            warn!("ClientPIN request missing CBOR body");
-            return Err(CTAP2_ERR_INVALID_CBOR);
+            return (None, None);
         }
 
         let reader = ClientPinRequestReader::new(&self.buffer[1..payload_len]);
-        let (sub_command, pin_protocol) = reader.read().map_err(|status| {
-            warn!(
-                "ClientPIN request parse failure -> CTAP2 status 0x{:02x}",
-                status
-            );
-            status
-        })?;
+        reader.read_partial().unwrap_or((None, None))
+    }
+
+    fn write_client_pin_response(&mut self, payload_len: usize) -> CborResponseInfo {
+        if payload_len < 2 {
+            warn!("ClientPIN request missing CBOR body");
+            let status = CTAP2_ERR_INVALID_CBOR;
+            let len = self.write_status_only_response(status);
+            return CborResponseInfo {
+                len,
+                status,
+                sub_command: None,
+                pin_protocol: None,
+            };
+        }
+
+        let reader = ClientPinRequestReader::new(&self.buffer[1..payload_len]);
+        let (sub_command, pin_protocol) = match reader.read() {
+            Ok(values) => values,
+            Err(status) => {
+                warn!(
+                    "ClientPIN request parse failure -> CTAP2 status 0x{:02x}",
+                    status
+                );
+                let len = self.write_status_only_response(status);
+                return CborResponseInfo {
+                    len,
+                    status,
+                    sub_command: None,
+                    pin_protocol: None,
+                };
+            }
+        };
 
         if pin_protocol != 1 {
+            let status = CTAP2_ERR_INVALID_PARAMETER;
             warn!(
                 "ClientPIN pinProtocol {} unsupported -> CTAP2 status 0x{:02x}",
-                pin_protocol, CTAP2_ERR_PIN_AUTH_INVALID
+                pin_protocol, status
             );
-            return Err(CTAP2_ERR_PIN_AUTH_INVALID);
+            let len = self.write_status_only_response(status);
+            return CborResponseInfo {
+                len,
+                status,
+                sub_command: Some(sub_command),
+                pin_protocol: Some(pin_protocol),
+            };
         }
 
         match sub_command {
-            CLIENT_PIN_SUBCMD_GET_RETRIES => Ok(self.write_client_pin_get_retries()),
+            CLIENT_PIN_SUBCMD_GET_RETRIES => CborResponseInfo {
+                len: self.write_client_pin_get_retries(),
+                status: CTAP_STATUS_OK,
+                sub_command: Some(sub_command),
+                pin_protocol: Some(pin_protocol),
+            },
+            CLIENT_PIN_SUBCMD_GET_UV_RETRIES => {
+                let status = CTAP2_ERR_UNSUPPORTED_OPTION;
+                let len = self.write_status_only_response(status);
+                CborResponseInfo {
+                    len,
+                    status,
+                    sub_command: Some(sub_command),
+                    pin_protocol: Some(pin_protocol),
+                }
+            }
             other => {
+                let status = CTAP2_ERR_PIN_NOT_SET;
                 warn!(
                     "ClientPIN subCommand=0x{:02x} unsupported -> CTAP2 status 0x{:02x}",
-                    other, CTAP2_ERR_PIN_NOT_SET
+                    other, status
                 );
-                Err(CTAP2_ERR_PIN_NOT_SET)
+                let len = self.write_status_only_response(status);
+                CborResponseInfo {
+                    len,
+                    status,
+                    sub_command: Some(sub_command),
+                    pin_protocol: Some(pin_protocol),
+                }
             }
         }
     }
@@ -745,7 +867,14 @@ impl<'a> ClientPinRequestReader<'a> {
         Self { data, offset: 0 }
     }
 
-    fn read(mut self) -> Result<(u8, u8), u8> {
+    fn read(self) -> Result<(u8, u8), u8> {
+        let (sub_command, pin_protocol) = self.read_partial()?;
+        let sub_command = sub_command.ok_or(CTAP2_ERR_INVALID_CBOR)?;
+        let pin_protocol = pin_protocol.ok_or(CTAP2_ERR_INVALID_CBOR)?;
+        Ok((sub_command, pin_protocol))
+    }
+
+    fn read_partial(mut self) -> Result<(Option<u8>, Option<u8>), u8> {
         let entries = self.read_map_len()?;
         let mut sub_command = None;
         let mut pin_protocol = None;
@@ -765,8 +894,6 @@ impl<'a> ClientPinRequestReader<'a> {
             }
         }
 
-        let sub_command = sub_command.ok_or(CTAP2_ERR_INVALID_CBOR)?;
-        let pin_protocol = pin_protocol.ok_or(CTAP2_ERR_INVALID_CBOR)?;
         Ok((sub_command, pin_protocol))
     }
 
