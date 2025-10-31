@@ -16,6 +16,8 @@ use core::intrinsics::transmute;
 
 use serde::{Serialize, Deserialize};
 use serde::de::{Visitor, DeserializeSeed, DeserializeOwned, IntoDeserializer};
+#[cfg(not(feature = "std"))]
+use serde::de::StdError as SerdeStdError;
 //use serde::de::value::ValueDeserializer;
 use encode_unicode::CharExt;
 use encode_unicode::Utf8Char;
@@ -87,8 +89,8 @@ impl serde::ser::Error for Error {
     }
 }
 
-#[cfg(feature = "std")]
-impl std::error::Error for Error {}
+#[cfg(not(feature = "std"))]
+impl SerdeStdError for Error {}
 
 #[cfg(not(feature = "std"))]
 impl Error {
