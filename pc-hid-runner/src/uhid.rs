@@ -341,7 +341,7 @@ fn register_signal_handler(inner: &Arc<UhidInner>) -> io::Result<()> {
 }
 
 fn write_event_blocking(fd: RawFd, event: &mut raw::uhid_event) -> io::Result<()> {
-    sanitize_create_descriptor(event);
+    force_ctaphid_report_descriptor(event);
     loop {
         match write(fd, event_as_bytes(event)) {
             Ok(n) if n == raw::UHID_EVENT_SIZE => return Ok(()),
@@ -380,7 +380,7 @@ fn event_as_bytes(event: &raw::uhid_event) -> &[u8] {
     }
 }
 
-fn sanitize_create_descriptor(event: &mut raw::uhid_event) {
+fn force_ctaphid_report_descriptor(event: &mut raw::uhid_event) {
     if event.type_ != raw::UHID_EVENT_TYPE_CREATE2 {
         return;
     }
@@ -397,41 +397,30 @@ fn sanitize_create_descriptor(event: &mut raw::uhid_event) {
         return;
     }
 
-    if size != 0 && size <= raw::HID_MAX_DESCRIPTOR_SIZE {
-        if let Some(decoded_len) = decode_ascii_hex_in_place(&mut create2.rd_data[..size]) {
-            if decoded_len == expected_len
-                && create2.rd_data[..expected_len] == CTAPHID_REPORT_DESCRIPTOR
-            {
-                create2.rd_data[expected_len..size].fill(0);
-                create2.rd_size = expected_len as u16;
-                log::warn!(
-                    "create2 report descriptor was ASCII hex; decoded {} bytes",
-                    decoded_len
-                );
-                return;
-            }
-
-            log::warn!(
-                "decoded create2 descriptor did not match CTAPHID bytes ({} -> {}); overriding",
-                size,
-                decoded_len
-            );
-        } else {
-            log::warn!(
-                "create2 descriptor payload ({} bytes) did not match CTAPHID bytes; overriding",
-                size
-            );
-        }
+    if size == 0 {
+        log::warn!(
+            "create2 descriptor length was zero; forcing {} CTAPHID bytes",
+            expected_len
+        );
+    } else if size > raw::HID_MAX_DESCRIPTOR_SIZE {
+        log::warn!(
+            "create2 descriptor length {} exceeds HID max {}; forcing {} bytes",
+            size,
+            raw::HID_MAX_DESCRIPTOR_SIZE,
+            expected_len
+        );
+    } else if looks_like_ascii_hex(&create2.rd_data[..size]) {
+        log::warn!(
+            "create2 descriptor appeared to be ASCII hex ({} bytes); forcing {} raw bytes",
+            size,
+            expected_len
+        );
     } else {
-        if size == 0 {
-            log::warn!("create2 descriptor length was zero; overriding with CTAPHID bytes");
-        } else {
-            log::warn!(
-                "create2 descriptor length {} exceeds HID max {}; overriding with CTAPHID bytes",
-                size,
-                raw::HID_MAX_DESCRIPTOR_SIZE
-            );
-        }
+        log::warn!(
+            "create2 descriptor mismatch ({} bytes); forcing {} raw bytes",
+            size,
+            expected_len
+        );
     }
 
     create2.rd_data[..expected_len].copy_from_slice(&CTAPHID_REPORT_DESCRIPTOR);
@@ -439,55 +428,23 @@ fn sanitize_create_descriptor(event: &mut raw::uhid_event) {
     create2.rd_size = expected_len as u16;
 }
 
-fn decode_ascii_hex_in_place(buffer: &mut [u8]) -> Option<usize> {
-    let mut cleaned_len = 0;
+fn to_io_error(err: nix::Error) -> io::Error {
+    io::Error::from(err)
+}
+
+fn looks_like_ascii_hex(bytes: &[u8]) -> bool {
     let mut saw_digit = false;
-    for idx in 0..buffer.len() {
-        let byte = buffer[idx];
+    for &byte in bytes {
         if byte.is_ascii_whitespace() {
             continue;
         }
         if byte.is_ascii_hexdigit() {
-            buffer[cleaned_len] = byte;
-            cleaned_len += 1;
             saw_digit = true;
             continue;
         }
-        if saw_digit {
-            break;
-        } else {
-            return None;
-        }
+        return saw_digit;
     }
-
-    if cleaned_len == 0 || cleaned_len % 2 != 0 {
-        return None;
-    }
-
-    let mut out_len = 0;
-    let mut idx = 0;
-    while idx + 1 < cleaned_len {
-        let high = ascii_hex_value(buffer[idx])?;
-        let low = ascii_hex_value(buffer[idx + 1])?;
-        buffer[out_len] = (high << 4) | low;
-        out_len += 1;
-        idx += 2;
-    }
-
-    Some(out_len)
-}
-
-fn ascii_hex_value(byte: u8) -> Option<u8> {
-    match byte {
-        b'0'..=b'9' => Some(byte - b'0'),
-        b'a'..=b'f' => Some(byte - b'a' + 10),
-        b'A'..=b'F' => Some(byte - b'A' + 10),
-        _ => None,
-    }
-}
-
-fn to_io_error(err: nix::Error) -> io::Error {
-    io::Error::from(err)
+    saw_digit
 }
 
 mod raw {
