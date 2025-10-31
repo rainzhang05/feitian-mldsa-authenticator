@@ -80,7 +80,7 @@ bitflags::bitflags! {
 
 bitflags::bitflags! {
    pub struct Direction: u32 {
-      const OUT = 0x0000000;
-      const IN = 0x0000001;
+      const OUT = 0x00000000;
+      const IN = 0x00000001;
    }
 }

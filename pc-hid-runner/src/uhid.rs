@@ -241,8 +241,8 @@ impl UhidInner {
     fn send_input_report(&self, data: &[u8; CTAPHID_FRAME_LEN]) -> io::Result<()> {
         let mut event = raw::uhid_event::default();
         event.type_ = raw::UHID_EVENT_TYPE_INPUT2;
-        event.u.input2.size = CTAPHID_FRAME_LEN as u16;
         unsafe {
+            event.u.input2.size = CTAPHID_FRAME_LEN as u16;
             event.u.input2.data[..CTAPHID_FRAME_LEN].copy_from_slice(data);
         }
         write_event_blocking(self.fd.as_raw_fd(), &event)
@@ -257,10 +257,10 @@ impl UhidInner {
         }
         let mut event = raw::uhid_event::default();
         event.type_ = raw::UHID_EVENT_TYPE_GET_REPORT_REPLY;
-        event.u.get_report_reply.id = id;
-        event.u.get_report_reply.err = err;
-        event.u.get_report_reply.size = data.len() as u16;
         unsafe {
+            event.u.get_report_reply.id = id;
+            event.u.get_report_reply.err = err;
+            event.u.get_report_reply.size = data.len() as u16;
             event.u.get_report_reply.data[..data.len()].copy_from_slice(data);
         }
         write_event_blocking(self.fd.as_raw_fd(), &event)
@@ -269,8 +269,10 @@ impl UhidInner {
     fn send_set_report_reply(&self, id: u32, err: u16) -> io::Result<()> {
         let mut event = raw::uhid_event::default();
         event.type_ = raw::UHID_EVENT_TYPE_SET_REPORT_REPLY;
-        event.u.set_report_reply.id = id;
-        event.u.set_report_reply.err = err;
+        unsafe {
+            event.u.set_report_reply.id = id;
+            event.u.set_report_reply.err = err;
+        }
         write_event_blocking(self.fd.as_raw_fd(), &event)
     }
 
