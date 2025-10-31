@@ -16,7 +16,7 @@ use std::time::Duration;
 const DEVICE_PATH: &str = "/dev/uhid";
 
 pub const CTAPHID_FRAME_LEN: usize = 64;
-const BUS_USB: u16 = 0x03;
+const BUS_USB: u16 = raw::BUS_USB;
 
 // HID report descriptor describing a CTAPHID/FIDO2 authenticator. Keeping it as a raw
 // byte array avoids any accidental ASCII serialization before it is submitted to the
@@ -304,8 +304,7 @@ fn descriptor_to_create2(descriptor: &HidDeviceDescriptor) -> io::Result<raw::uh
     req.product = descriptor.product_id;
     req.version = descriptor.version;
     req.country = descriptor.country;
-    req.rd_data[..FIDO_HID_REPORT_DESCRIPTOR_LENGTH]
-        .copy_from_slice(&CTAPHID_REPORT_DESCRIPTOR);
+    req.rd_data[..FIDO_HID_REPORT_DESCRIPTOR_LENGTH].copy_from_slice(&CTAPHID_REPORT_DESCRIPTOR);
     Ok(req)
 }
 
@@ -376,181 +375,49 @@ fn to_io_error(err: nix::Error) -> io::Error {
     io::Error::from(err)
 }
 
+#[allow(
+    non_camel_case_types,
+    non_snake_case,
+    non_upper_case_globals,
+    dead_code
+)]
+mod raw_bindings {
+    include!(concat!(env!("OUT_DIR"), "/uhid_bindings.rs"));
+}
+
 mod raw {
-    pub const UHID_DATA_MAX: usize = 4096;
-    pub const HID_MAX_DESCRIPTOR_SIZE: usize = 4096;
+    use super::raw_bindings;
 
-    pub const UHID_EVENT_TYPE_DESTROY: u32 = 1;
-    pub const UHID_EVENT_TYPE_START: u32 = 2;
-    pub const UHID_EVENT_TYPE_STOP: u32 = 3;
-    pub const UHID_EVENT_TYPE_OPEN: u32 = 4;
-    pub const UHID_EVENT_TYPE_CLOSE: u32 = 5;
-    pub const UHID_EVENT_TYPE_OUTPUT: u32 = 6;
-    pub const UHID_EVENT_TYPE_GET_REPORT: u32 = 9;
-    pub const UHID_EVENT_TYPE_GET_REPORT_REPLY: u32 = 10;
-    pub const UHID_EVENT_TYPE_CREATE2: u32 = 11;
-    pub const UHID_EVENT_TYPE_INPUT2: u32 = 12;
-    pub const UHID_EVENT_TYPE_SET_REPORT: u32 = 13;
-    pub const UHID_EVENT_TYPE_SET_REPORT_REPLY: u32 = 14;
+    pub use raw_bindings::uhid_create2_req;
+    pub use raw_bindings::uhid_event;
 
-    pub const UHID_REPORT_TYPE_FEATURE: u8 = 0;
-    pub const UHID_REPORT_TYPE_OUTPUT: u8 = 1;
-    pub const UHID_REPORT_TYPE_INPUT: u8 = 2;
+    pub const BUS_USB: u16 = raw_bindings::BUS_USB as u16;
+    pub const HID_MAX_DESCRIPTOR_SIZE: usize = raw_bindings::HID_MAX_DESCRIPTOR_SIZE as usize;
+    pub const UHID_DATA_MAX: usize = raw_bindings::UHID_DATA_MAX as usize;
+
+    pub const UHID_EVENT_TYPE_DESTROY: u32 = raw_bindings::uhid_event_type_UHID_DESTROY as u32;
+    pub const UHID_EVENT_TYPE_START: u32 = raw_bindings::uhid_event_type_UHID_START as u32;
+    pub const UHID_EVENT_TYPE_STOP: u32 = raw_bindings::uhid_event_type_UHID_STOP as u32;
+    pub const UHID_EVENT_TYPE_OPEN: u32 = raw_bindings::uhid_event_type_UHID_OPEN as u32;
+    pub const UHID_EVENT_TYPE_CLOSE: u32 = raw_bindings::uhid_event_type_UHID_CLOSE as u32;
+    pub const UHID_EVENT_TYPE_OUTPUT: u32 = raw_bindings::uhid_event_type_UHID_OUTPUT as u32;
+    pub const UHID_EVENT_TYPE_GET_REPORT: u32 =
+        raw_bindings::uhid_event_type_UHID_GET_REPORT as u32;
+    pub const UHID_EVENT_TYPE_GET_REPORT_REPLY: u32 =
+        raw_bindings::uhid_event_type_UHID_GET_REPORT_REPLY as u32;
+    pub const UHID_EVENT_TYPE_CREATE2: u32 = raw_bindings::uhid_event_type_UHID_CREATE2 as u32;
+    pub const UHID_EVENT_TYPE_INPUT2: u32 = raw_bindings::uhid_event_type_UHID_INPUT2 as u32;
+    pub const UHID_EVENT_TYPE_SET_REPORT: u32 =
+        raw_bindings::uhid_event_type_UHID_SET_REPORT as u32;
+    pub const UHID_EVENT_TYPE_SET_REPORT_REPLY: u32 =
+        raw_bindings::uhid_event_type_UHID_SET_REPORT_REPLY as u32;
+
+    pub const UHID_REPORT_TYPE_FEATURE: u8 =
+        raw_bindings::uhid_report_type_UHID_FEATURE_REPORT as u8;
+    pub const UHID_REPORT_TYPE_OUTPUT: u8 = raw_bindings::uhid_report_type_UHID_OUTPUT_REPORT as u8;
+    pub const UHID_REPORT_TYPE_INPUT: u8 = raw_bindings::uhid_report_type_UHID_INPUT_REPORT as u8;
 
     pub const UHID_EVENT_SIZE: usize = core::mem::size_of::<uhid_event>();
-
-    #[repr(C, packed)]
-    #[derive(Clone, Copy)]
-    pub struct uhid_create2_req {
-        pub name: [u8; 128],
-        pub phys: [u8; 64],
-        pub uniq: [u8; 64],
-        pub rd_size: u16,
-        pub bus: u16,
-        pub vendor: u32,
-        pub product: u32,
-        pub version: u32,
-        pub country: u32,
-        pub rd_data: [u8; HID_MAX_DESCRIPTOR_SIZE],
-    }
-
-    impl Default for uhid_create2_req {
-        fn default() -> Self {
-            unsafe { core::mem::zeroed() }
-        }
-    }
-
-    #[repr(C, packed)]
-    #[derive(Clone, Copy)]
-    pub struct uhid_input2_req {
-        pub size: u16,
-        pub data: [u8; UHID_DATA_MAX],
-    }
-
-    impl Default for uhid_input2_req {
-        fn default() -> Self {
-            unsafe { core::mem::zeroed() }
-        }
-    }
-
-    #[repr(C, packed)]
-    #[derive(Clone, Copy)]
-    pub struct uhid_output_req {
-        pub data: [u8; UHID_DATA_MAX],
-        pub size: u16,
-        pub rtype: u8,
-    }
-
-    impl Default for uhid_output_req {
-        fn default() -> Self {
-            unsafe { core::mem::zeroed() }
-        }
-    }
-
-    #[repr(C, packed)]
-    #[derive(Clone, Copy)]
-    pub struct uhid_get_report_req {
-        pub id: u32,
-        pub rnum: u8,
-        pub rtype: u8,
-    }
-
-    impl Default for uhid_get_report_req {
-        fn default() -> Self {
-            unsafe { core::mem::zeroed() }
-        }
-    }
-
-    #[repr(C, packed)]
-    #[derive(Clone, Copy)]
-    pub struct uhid_get_report_reply_req {
-        pub id: u32,
-        pub err: u16,
-        pub size: u16,
-        pub data: [u8; UHID_DATA_MAX],
-    }
-
-    impl Default for uhid_get_report_reply_req {
-        fn default() -> Self {
-            unsafe { core::mem::zeroed() }
-        }
-    }
-
-    #[repr(C, packed)]
-    #[derive(Clone, Copy)]
-    pub struct uhid_set_report_req {
-        pub id: u32,
-        pub rnum: u8,
-        pub rtype: u8,
-        pub size: u16,
-        pub data: [u8; UHID_DATA_MAX],
-    }
-
-    impl Default for uhid_set_report_req {
-        fn default() -> Self {
-            unsafe { core::mem::zeroed() }
-        }
-    }
-
-    #[repr(C, packed)]
-    #[derive(Clone, Copy)]
-    pub struct uhid_set_report_reply_req {
-        pub id: u32,
-        pub err: u16,
-    }
-
-    impl Default for uhid_set_report_reply_req {
-        fn default() -> Self {
-            unsafe { core::mem::zeroed() }
-        }
-    }
-
-    #[repr(C, packed)]
-    #[derive(Clone, Copy)]
-    pub struct uhid_start_req {
-        pub dev_flags: u64,
-    }
-
-    impl Default for uhid_start_req {
-        fn default() -> Self {
-            unsafe { core::mem::zeroed() }
-        }
-    }
-
-    #[repr(C, packed)]
-    #[derive(Clone, Copy)]
-    pub union uhid_event_union {
-        pub create2: uhid_create2_req,
-        pub input2: uhid_input2_req,
-        pub output: uhid_output_req,
-        pub get_report: uhid_get_report_req,
-        pub get_report_reply: uhid_get_report_reply_req,
-        pub set_report: uhid_set_report_req,
-        pub set_report_reply: uhid_set_report_reply_req,
-        pub start: uhid_start_req,
-    }
-
-    impl Default for uhid_event_union {
-        fn default() -> Self {
-            unsafe { core::mem::zeroed() }
-        }
-    }
-
-    #[repr(C, packed)]
-    #[derive(Clone, Copy)]
-    pub struct uhid_event {
-        pub type_: u32,
-        pub u: uhid_event_union,
-    }
-
-    impl Default for uhid_event {
-        fn default() -> Self {
-            Self {
-                type_: 0,
-                u: uhid_event_union::default(),
-            }
-        }
-    }
 
     pub fn event_from_bytes(bytes: &[u8; UHID_EVENT_SIZE]) -> uhid_event {
         unsafe { core::ptr::read(bytes.as_ptr() as *const uhid_event) }
@@ -634,7 +501,10 @@ mod tests {
         let descriptor = super::HidDeviceDescriptor::default();
         let request = super::descriptor_to_create2(&descriptor).expect("create request");
 
-        assert_eq!(request.rd_size as usize, super::FIDO_HID_REPORT_DESCRIPTOR_LENGTH);
+        assert_eq!(
+            request.rd_size as usize,
+            super::FIDO_HID_REPORT_DESCRIPTOR_LENGTH
+        );
         assert_eq!(
             &request.rd_data[..super::FIDO_HID_REPORT_DESCRIPTOR_LENGTH],
             &super::CTAPHID_REPORT_DESCRIPTOR,

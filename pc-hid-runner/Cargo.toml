@@ -3,6 +3,7 @@ name = "pc-hid-runner"
 version = "0.1.0"
 edition = "2021"
 default-run = "pc-hid-runner"
+build = "build.rs"
 
 [dependencies]
 ctaphid-dispatch = { version = "0.3", features = ["log-all"] }
@@ -22,6 +23,9 @@ trussed = { version = "0.1", default-features = false, features = ["log-all", "v
 authenticator = { path = "../authenticator" }
 daemonize = "0.4"
 rand = { version = "0.8", features = ["std"] }
+
+[build-dependencies]
+bindgen = "0.70"
 
 [dependencies.pc-usbip-runner]
 optional = true
