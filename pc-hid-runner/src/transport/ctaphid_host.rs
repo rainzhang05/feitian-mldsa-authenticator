@@ -1,4 +1,9 @@
-use std::{collections::VecDeque, convert::TryInto};
+use std::{
+    collections::{HashSet, VecDeque},
+    convert::TryInto,
+};
+
+use rand::{rngs::OsRng, CryptoRng, RngCore};
 
 use crate::uhid::{CtapHidFrame, CTAPHID_FRAME_LEN};
 use ctaphid_dispatch::{
@@ -9,6 +14,7 @@ use heapless_bytes::Bytes;
 use interchange::State as InterchangeState;
 
 const PACKET_SIZE: usize = CTAPHID_FRAME_LEN;
+const CHANNEL_GENERATION_RETRY_LIMIT: usize = 64;
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct Version {
@@ -115,12 +121,13 @@ pub enum KeepaliveStatus {
     UpNeeded = 2,
 }
 
-pub struct CtaphidHost<'pipe, const N: usize> {
+pub struct CtaphidHost<'pipe, const N: usize, R = OsRng> {
     requester: Requester<'pipe, N>,
     state: State,
     buffer: [u8; N],
     pending: VecDeque<CtapHidFrame>,
-    last_channel: u32,
+    allocated_channels: HashSet<u32>,
+    rng: R,
     implements: u8,
     version: Version,
     started_processing: bool,
@@ -128,14 +135,24 @@ pub struct CtaphidHost<'pipe, const N: usize> {
     last_millis: u64,
 }
 
-impl<'pipe, const N: usize> CtaphidHost<'pipe, N> {
+impl<'pipe, const N: usize> CtaphidHost<'pipe, N, OsRng> {
     pub fn new(requester: Requester<'pipe, N>) -> Self {
+        Self::with_rng(requester, OsRng)
+    }
+}
+
+impl<'pipe, const N: usize, R> CtaphidHost<'pipe, N, R>
+where
+    R: RngCore + CryptoRng,
+{
+    pub fn with_rng(requester: Requester<'pipe, N>, rng: R) -> Self {
         Self {
             requester,
             state: State::Idle,
             buffer: [0u8; N],
             pending: VecDeque::new(),
-            last_channel: 0,
+            allocated_channels: HashSet::new(),
+            rng,
             implements: 0x80,
             version: Version::default(),
             started_processing: false,
@@ -365,13 +382,27 @@ impl<'pipe, const N: usize> CtaphidHost<'pipe, N> {
             return;
         }
 
-        self.last_channel = self.last_channel.wrapping_add(1);
+        let assigned_channel = if request.channel == 0xffffffff {
+            match self.allocate_channel() {
+                Ok(channel) => channel,
+                Err(error) => {
+                    self.start_sending_error(request, error);
+                    return;
+                }
+            }
+        } else if self.allocated_channels.contains(&request.channel) {
+            request.channel
+        } else {
+            self.start_sending_error(request, AuthenticatorError::InvalidChannel);
+            return;
+        };
+
         let response = Response {
             channel: request.channel,
             command: request.command,
             length: 17,
         };
-        self.buffer[8..12].copy_from_slice(&self.last_channel.to_be_bytes());
+        self.buffer[8..12].copy_from_slice(&assigned_channel.to_be_bytes());
         self.buffer[12] = 2;
         self.buffer[13] = self.version.major;
         self.buffer[14] = self.version.minor;
@@ -490,6 +521,19 @@ impl<'pipe, const N: usize> CtaphidHost<'pipe, N> {
         frame[7] = status as u8;
         self.pending.push_back(CtapHidFrame::new(frame));
     }
+
+    fn allocate_channel(&mut self) -> Result<u32, AuthenticatorError> {
+        for _ in 0..CHANNEL_GENERATION_RETRY_LIMIT {
+            let candidate = self.rng.next_u32();
+            if candidate == 0 || candidate == 0xffffffff {
+                continue;
+            }
+            if self.allocated_channels.insert(candidate) {
+                return Ok(candidate);
+            }
+        }
+        Err(AuthenticatorError::ChannelBusy)
+    }
 }
 
 #[cfg(test)]
@@ -497,6 +541,7 @@ mod tests {
     use super::*;
     use crate::{CAPABILITY_CBOR, CAPABILITY_NMSG};
     use ctaphid_dispatch::{app::App, Channel, Dispatch, DEFAULT_MESSAGE_SIZE};
+    use std::convert::TryInto;
 
     struct EchoApp;
 
@@ -521,19 +566,195 @@ mod tests {
         Dispatch<'static, 'static, DEFAULT_MESSAGE_SIZE>,
         EchoApp,
     ) {
+        let (host, dispatch, app) = init_host_with_rng(OsRng);
+        (host, dispatch, app)
+    }
+
+    fn init_host_with_rng<R>(
+        rng: R,
+    ) -> (
+        CtaphidHost<'static, DEFAULT_MESSAGE_SIZE, R>,
+        Dispatch<'static, 'static, DEFAULT_MESSAGE_SIZE>,
+        EchoApp,
+    )
+    where
+        R: RngCore + CryptoRng,
+    {
         let channel = Box::leak(Box::new(Channel::<{ DEFAULT_MESSAGE_SIZE }>::new()));
         let (rq, rp) = channel.split().unwrap();
-        let host = CtaphidHost::new(rq);
+        let host = CtaphidHost::with_rng(rq, rng);
         let dispatch = Dispatch::new(rp);
         (host, dispatch, EchoApp)
     }
 
-    fn take_frame_bytes(host: &mut CtaphidHost<'static, DEFAULT_MESSAGE_SIZE>) -> Vec<[u8; 64]> {
+    fn take_frame_bytes<R>(
+        host: &mut CtaphidHost<'static, DEFAULT_MESSAGE_SIZE, R>,
+    ) -> Vec<[u8; 64]>
+    where
+        R: RngCore + CryptoRng,
+    {
         let mut frames = Vec::new();
         while let Some(frame) = host.next_outgoing_frame() {
             frames.push(*frame.as_bytes());
         }
         frames
+    }
+
+    #[derive(Clone)]
+    struct TestRng {
+        values: Vec<u32>,
+        index: usize,
+    }
+
+    impl TestRng {
+        fn new(values: &[u32]) -> Self {
+            Self {
+                values: values.to_vec(),
+                index: 0,
+            }
+        }
+
+        fn next_value(&mut self) -> u32 {
+            let value = self
+                .values
+                .get(self.index)
+                .copied()
+                .expect("test RNG exhausted");
+            self.index += 1;
+            value
+        }
+    }
+
+    impl RngCore for TestRng {
+        fn next_u32(&mut self) -> u32 {
+            self.next_value()
+        }
+
+        fn next_u64(&mut self) -> u64 {
+            let high = self.next_value() as u64;
+            let low = self.next_value() as u64;
+            (high << 32) | low
+        }
+
+        fn fill_bytes(&mut self, dest: &mut [u8]) {
+            for chunk in dest.chunks_mut(4) {
+                let value = self.next_value().to_le_bytes();
+                let len = chunk.len();
+                chunk.copy_from_slice(&value[..len]);
+            }
+        }
+
+        fn try_fill_bytes(&mut self, dest: &mut [u8]) -> Result<(), rand::Error> {
+            self.fill_bytes(dest);
+            Ok(())
+        }
+    }
+
+    impl CryptoRng for TestRng {}
+
+    #[test]
+    fn broadcast_init_skips_reserved_ids() {
+        let (mut host, mut dispatch, mut app) =
+            init_host_with_rng(TestRng::new(&[0, 0xffffffff, 0x1234_5678]));
+        host.set_capabilities(CAPABILITY_CBOR | CAPABILITY_NMSG);
+
+        let mut init_packet = [0u8; 64];
+        init_packet[..4].copy_from_slice(&0xffffffffu32.to_be_bytes());
+        init_packet[4] = Command::Init.into_u8() | 0x80;
+        init_packet[5..7].copy_from_slice(&8u16.to_be_bytes());
+        init_packet[7..15].copy_from_slice(&[0xAA; 8]);
+        host.handle_frame(&CtapHidFrame::new(init_packet), 0);
+        let mut apps: [&mut dyn App<'static, DEFAULT_MESSAGE_SIZE>; 1] = [&mut app];
+        let _ = host.poll_dispatch(&mut dispatch, &mut apps);
+
+        let frames = take_frame_bytes(&mut host);
+        assert_eq!(frames.len(), 1);
+        let assigned = u32::from_be_bytes(frames[0][8..12].try_into().unwrap());
+        assert_eq!(assigned, 0x1234_5678);
+    }
+
+    #[test]
+    fn reinit_existing_channel_reuses_cid() {
+        let (mut host, mut dispatch, mut app) =
+            init_host_with_rng(TestRng::new(&[0xA1A2_A3A4, 0xDEAD_BEEF]));
+        host.set_capabilities(CAPABILITY_CBOR | CAPABILITY_NMSG);
+
+        let mut broadcast_init = [0u8; 64];
+        broadcast_init[..4].copy_from_slice(&0xffffffffu32.to_be_bytes());
+        broadcast_init[4] = Command::Init.into_u8() | 0x80;
+        broadcast_init[5..7].copy_from_slice(&8u16.to_be_bytes());
+        broadcast_init[7..15].copy_from_slice(&[0x11; 8]);
+        host.handle_frame(&CtapHidFrame::new(broadcast_init), 0);
+        let mut apps: [&mut dyn App<'static, DEFAULT_MESSAGE_SIZE>; 1] = [&mut app];
+        let _ = host.poll_dispatch(&mut dispatch, &mut apps);
+
+        let frames = take_frame_bytes(&mut host);
+        assert_eq!(frames.len(), 1);
+        let assigned = u32::from_be_bytes(frames[0][8..12].try_into().unwrap());
+        assert_eq!(assigned, 0xA1A2_A3A4);
+
+        let mut reinit_packet = [0u8; 64];
+        reinit_packet[..4].copy_from_slice(&assigned.to_be_bytes());
+        reinit_packet[4] = Command::Init.into_u8() | 0x80;
+        reinit_packet[5..7].copy_from_slice(&8u16.to_be_bytes());
+        reinit_packet[7..15].copy_from_slice(&[0x22; 8]);
+        host.handle_frame(&CtapHidFrame::new(reinit_packet), 10);
+        let mut apps: [&mut dyn App<'static, DEFAULT_MESSAGE_SIZE>; 1] = [&mut app];
+        let _ = host.poll_dispatch(&mut dispatch, &mut apps);
+
+        let frames = take_frame_bytes(&mut host);
+        assert_eq!(frames.len(), 1);
+        let reused = u32::from_be_bytes(frames[0][8..12].try_into().unwrap());
+        assert_eq!(reused, assigned);
+
+        let mut second_broadcast = [0u8; 64];
+        second_broadcast[..4].copy_from_slice(&0xffffffffu32.to_be_bytes());
+        second_broadcast[4] = Command::Init.into_u8() | 0x80;
+        second_broadcast[5..7].copy_from_slice(&8u16.to_be_bytes());
+        second_broadcast[7..15].copy_from_slice(&[0x33; 8]);
+        host.handle_frame(&CtapHidFrame::new(second_broadcast), 20);
+        let mut apps: [&mut dyn App<'static, DEFAULT_MESSAGE_SIZE>; 1] = [&mut app];
+        let _ = host.poll_dispatch(&mut dispatch, &mut apps);
+
+        let frames = take_frame_bytes(&mut host);
+        assert_eq!(frames.len(), 1);
+        let next_cid = u32::from_be_bytes(frames[0][8..12].try_into().unwrap());
+        assert_eq!(next_cid, 0xDEAD_BEEF);
+    }
+
+    #[test]
+    fn broadcast_init_retries_on_collision() {
+        let (mut host, mut dispatch, mut app) =
+            init_host_with_rng(TestRng::new(&[0x0102_0304, 0x0102_0304, 0x0BAD_F00D]));
+        host.set_capabilities(CAPABILITY_CBOR | CAPABILITY_NMSG);
+
+        let mut init_packet = [0u8; 64];
+        init_packet[..4].copy_from_slice(&0xffffffffu32.to_be_bytes());
+        init_packet[4] = Command::Init.into_u8() | 0x80;
+        init_packet[5..7].copy_from_slice(&8u16.to_be_bytes());
+        init_packet[7..15].copy_from_slice(&[0x01; 8]);
+        host.handle_frame(&CtapHidFrame::new(init_packet), 0);
+        let mut apps: [&mut dyn App<'static, DEFAULT_MESSAGE_SIZE>; 1] = [&mut app];
+        let _ = host.poll_dispatch(&mut dispatch, &mut apps);
+        let frames = take_frame_bytes(&mut host);
+        assert_eq!(frames.len(), 1);
+        let first_cid = u32::from_be_bytes(frames[0][8..12].try_into().unwrap());
+        assert_eq!(first_cid, 0x0102_0304);
+
+        let mut second_init = [0u8; 64];
+        second_init[..4].copy_from_slice(&0xffffffffu32.to_be_bytes());
+        second_init[4] = Command::Init.into_u8() | 0x80;
+        second_init[5..7].copy_from_slice(&8u16.to_be_bytes());
+        second_init[7..15].copy_from_slice(&[0x02; 8]);
+        host.handle_frame(&CtapHidFrame::new(second_init), 10);
+        let mut apps: [&mut dyn App<'static, DEFAULT_MESSAGE_SIZE>; 1] = [&mut app];
+        let _ = host.poll_dispatch(&mut dispatch, &mut apps);
+
+        let frames = take_frame_bytes(&mut host);
+        assert_eq!(frames.len(), 1);
+        let second_cid = u32::from_be_bytes(frames[0][8..12].try_into().unwrap());
+        assert_eq!(second_cid, 0x0BAD_F00D);
+        assert_ne!(first_cid, second_cid);
     }
 
     #[test]
