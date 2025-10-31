@@ -308,7 +308,7 @@ fn descriptor_to_create2(descriptor: &HidDeviceDescriptor) -> io::Result<raw::uh
     copy_str_to_array(&descriptor.name, &mut req.name);
     req.rd_size = CTAPHID_REPORT_DESCRIPTOR.len() as u16;
 
-    let rd_size: u16 = unsafe { core::ptr::read_unaligned(&req.rd_size) };
+    let rd_size: u16 = unsafe { core::ptr::read_unaligned(core::ptr::addr_of!(req.rd_size)) };
     log::debug!("create2 rd_size={} (expected={})", rd_size, CTAPHID_REPORT_DESCRIPTOR.len() as u16);
     req.bus = BUS_USB;
     req.vendor = descriptor.vendor_id;
@@ -387,11 +387,11 @@ fn force_ctaphid_report_descriptor(event: &mut raw::uhid_event) {
     if event.type_ != raw::UHID_EVENT_TYPE_CREATE2 {
         return;
     }
-    let create2 = unsafe { &mut event.u.create2 };
-    let size = usize::from(create2.rd_size);
+
+    let size = unsafe { usize::from(core::ptr::read_unaligned(core::ptr::addr_of!(event.u.create2.rd_size))) };
     let expected_len = CTAPHID_REPORT_DESCRIPTOR.len();
 
-    if size >= expected_len && create2.rd_data[..expected_len] == CTAPHID_REPORT_DESCRIPTOR {
+    if size >= expected_len && unsafe { std::slice::from_raw_parts(core::ptr::addr_of!(event.u.create2.rd_data) as *const u8, expected_len) } == CTAPHID_REPORT_DESCRIPTOR {
         return;
     }
     if size == 0 {
