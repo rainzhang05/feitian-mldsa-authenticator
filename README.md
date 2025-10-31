@@ -97,9 +97,23 @@ If you build liboqs yourself, ensure the resulting shared library matches the ta
 
 ## Run the HID runner
 
-The HID runner provisions a virtual authenticator through `/dev/uhid`, creating a `hidraw` node that browsers can use transparently. A single command launches the service in the foreground:
+The HID runner provisions a virtual authenticator through `/dev/uhid`, creating a `hidraw` node that browsers can use transparently. The launches the service in the foreground:
 
 ```bash
+# Starting with clean state
+sudo pkill -f pc-hid-runner || true
+sudo rmmod uhid 2>/dev/null || true
+sudo modprobe uhid
+
+# Configure permission
+echo 'KERNEL=="uhid", MODE="0660", GROUP="plugdev"' | sudo tee /etc/udev/rules.d/70-uhid.rules
+sudo udevadm control --reload-rules
+sudo udevadm trigger
+sudo chown root:plugdev /dev/uhid
+sudo chmod 660 /dev/uhid
+newgrp plugdev
+
+# Launching the runner
 RUST_LOG=info cargo run -p pc-hid-runner -- start --foreground
 ```
 
@@ -112,57 +126,6 @@ Useful flags:
 
 Omit `--foreground` to run the service as a background daemon. The CLI also exposes `status` and `stop` subcommands that inspect or terminate that daemonised instance.
 
-## Troubleshooting
-
-If the runner is healthy you should observe the following:
-
-```bash
-# UHID-backed hidraw node present
-ls -l /dev/hidraw*
-
-# Device advertised on the USB bus
-lsusb -d 1998:0616
-
-# libfido2 detects the authenticator
-fido2-token -L
-```
-
-When debugging permissions or lingering devices:
-
-- Inspect `/sys/class/hidraw/hidraw*/device/uevent` for the `HID_ID=0003:1998:0616` line.
-- Remove orphaned hidraw nodes with `sudo rm /dev/hidrawX` after stopping the service if a crash leaves stale entries.
-- Restart the runner with `cargo run -p pc-hid-runner -- stop` followed by `start` to recreate the virtual token.
-
-For the legacy USB/IP backend, ensure `vhci-hcd` is loaded and detach stale ports with `sudo usbip detach -p <port>`.
-
-## Restricting local HID access
-
-The HID runner creates a hidraw character device that any local process could read if the
-node is world-accessible. Install the bundled udev rule to limit access to the
-`plugdev` group (or another group of your choice):
-
-```bash
-sudo install -m 0644 contrib/udev/70-feitian-authenticator.rules /etc/udev/rules.d/
-sudo udevadm control --reload
-```
-
-Add your user to the selected group and re-login so browsers and other applications can
-reach the authenticator:
-
-```bash
-sudo usermod -aG plugdev "$USER"
-```
-
-When the device is running you can confirm permissions via `/sys/class/hidraw`:
-
-```bash
-grep HID_ID /sys/class/hidraw/hidraw*/device/uevent | grep 1998:0616
-ls -l /dev/hidraw*
-```
-
-The CLI warns if `/dev/uhid` is inaccessible or if the hidraw node ends up world-readable,
-prompting you to adjust the rule or group membership.
-
 ## Validation
 
-Follow the steps in [`docs/validation.md`](docs/validation.md) to exercise WebAuthn registration, concurrent CTAP sessions, and keepalive behaviour before distributing new builds.
+Follow the steps in [`docs/validation.md`](docs/validation.md) to use WebAuthn registration, concurrent CTAP sessions, and keepalive behaviour before distributing new builds.
