@@ -9,7 +9,7 @@ use std::fs::OpenOptions;
 use std::io;
 use std::os::fd::{AsRawFd, FromRawFd, IntoRawFd, OwnedFd, RawFd};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use std::thread;
 use std::time::Duration;
 
@@ -18,15 +18,56 @@ const DEVICE_PATH: &str = "/dev/uhid";
 pub const CTAPHID_FRAME_LEN: usize = 64;
 const BUS_USB: u16 = raw::BUS_USB;
 
-// HID report descriptor describing a CTAPHID/FIDO2 authenticator. Keeping it as a raw
-// byte array avoids any accidental ASCII serialization before it is submitted to the
-// kernel via UHID_CREATE2.
-const CTAPHID_REPORT_DESCRIPTOR: [u8; 47] = [
-    0x06, 0xD0, 0xF1, 0x09, 0x01, 0xA1, 0x01, 0x09, 0x20, 0x15, 0x00, 0x26, 0xFF, 0x00, 0x75, 0x08,
-    0x95, 0x40, 0x81, 0x02, 0x09, 0x21, 0x15, 0x00, 0x26, 0xFF, 0x00, 0x75, 0x08, 0x95, 0x40, 0x91,
-    0x02, 0x09, 0x22, 0x15, 0x00, 0x26, 0xFF, 0x00, 0x75, 0x08, 0x95, 0x40, 0xB1, 0x02, 0xC0,
-];
-const FIDO_HID_REPORT_DESCRIPTOR_LENGTH: usize = CTAPHID_REPORT_DESCRIPTOR.len();
+// HID report descriptor describing a CTAPHID/FIDO2 authenticator. Stored as a hex
+// string and decoded into binary the first time it is needed so we always feed raw
+// bytes to the kernel, even if future refactors or serde round-trips introduce text
+// formatting.
+const CTAPHID_REPORT_DESCRIPTOR_HEX: &str = "\
+    06 d0 f1 09 01 a1 01 09 20 15 00 26 ff 00 75 08 \
+    95 40 81 02 09 21 15 00 26 ff 00 75 08 95 40 91 \
+    02 09 22 15 00 26 ff 00 75 08 95 40 b1 02 c0";
+
+const FIDO_HID_REPORT_DESCRIPTOR_LENGTH: usize = 47;
+
+fn ctaphid_report_descriptor() -> &'static [u8; FIDO_HID_REPORT_DESCRIPTOR_LENGTH] {
+    static DESCRIPTOR: OnceLock<[u8; FIDO_HID_REPORT_DESCRIPTOR_LENGTH]> = OnceLock::new();
+    DESCRIPTOR.get_or_init(|| decode_ctaphid_report_descriptor().expect("valid CTAPHID descriptor"))
+}
+
+fn decode_ctaphid_report_descriptor() -> Result<[u8; FIDO_HID_REPORT_DESCRIPTOR_LENGTH], String> {
+    let mut out = [0u8; FIDO_HID_REPORT_DESCRIPTOR_LENGTH];
+    let mut count = 0usize;
+
+    for token in CTAPHID_REPORT_DESCRIPTOR_HEX.split_whitespace() {
+        if token.is_empty() {
+            continue;
+        }
+        if count == FIDO_HID_REPORT_DESCRIPTOR_LENGTH {
+            return Err("too many bytes in CTAPHID report descriptor".to_string());
+        }
+
+        let trimmed = token.trim();
+        let trimmed = trimmed.strip_prefix("0x").unwrap_or(trimmed);
+        if trimmed.len() > 2 {
+            return Err(format!(
+                "invalid byte `{trimmed}` in CTAPHID report descriptor"
+            ));
+        }
+
+        let value = u8::from_str_radix(trimmed, 16)
+            .map_err(|_| format!("invalid hex byte `{trimmed}` in CTAPHID report descriptor"))?;
+        out[count] = value;
+        count += 1;
+    }
+
+    if count != FIDO_HID_REPORT_DESCRIPTOR_LENGTH {
+        return Err(format!(
+            "expected {FIDO_HID_REPORT_DESCRIPTOR_LENGTH} descriptor bytes, parsed {count}"
+        ));
+    }
+
+    Ok(out)
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct HidDeviceDescriptor {
@@ -298,13 +339,14 @@ fn descriptor_to_create2(descriptor: &HidDeviceDescriptor) -> io::Result<raw::uh
 
     let mut req = raw::uhid_create2_req::default();
     copy_str_to_array(&descriptor.name, &mut req.name);
+    let report_descriptor = ctaphid_report_descriptor();
     req.rd_size = FIDO_HID_REPORT_DESCRIPTOR_LENGTH as u16;
     req.bus = BUS_USB;
     req.vendor = descriptor.vendor_id;
     req.product = descriptor.product_id;
     req.version = descriptor.version;
     req.country = descriptor.country;
-    req.rd_data[..FIDO_HID_REPORT_DESCRIPTOR_LENGTH].copy_from_slice(&CTAPHID_REPORT_DESCRIPTOR);
+    req.rd_data[..FIDO_HID_REPORT_DESCRIPTOR_LENGTH].copy_from_slice(report_descriptor);
     Ok(req)
 }
 
@@ -486,14 +528,14 @@ mod tests {
 
     #[test]
     fn ctaphid_descriptor_matches_expected_bytes() {
-        let descriptor = super::CTAPHID_REPORT_DESCRIPTOR;
+        let descriptor = super::ctaphid_report_descriptor();
         let expected: [u8; super::FIDO_HID_REPORT_DESCRIPTOR_LENGTH] = [
             0x06, 0xD0, 0xF1, 0x09, 0x01, 0xA1, 0x01, 0x09, 0x20, 0x15, 0x00, 0x26, 0xFF, 0x00,
             0x75, 0x08, 0x95, 0x40, 0x81, 0x02, 0x09, 0x21, 0x15, 0x00, 0x26, 0xFF, 0x00, 0x75,
             0x08, 0x95, 0x40, 0x91, 0x02, 0x09, 0x22, 0x15, 0x00, 0x26, 0xFF, 0x00, 0x75, 0x08,
             0x95, 0x40, 0xB1, 0x02, 0xC0,
         ];
-        assert_eq!(descriptor, expected);
+        assert_eq!(descriptor.as_slice(), &expected[..]);
     }
 
     #[test]
@@ -507,7 +549,7 @@ mod tests {
         );
         assert_eq!(
             &request.rd_data[..super::FIDO_HID_REPORT_DESCRIPTOR_LENGTH],
-            &super::CTAPHID_REPORT_DESCRIPTOR,
+            super::ctaphid_report_descriptor().as_slice(),
         );
     }
 }
