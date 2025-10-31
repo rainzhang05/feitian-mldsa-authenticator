@@ -713,6 +713,61 @@ mod tests {
     }
 
     #[test]
+    fn descriptor_matches_fido2_hid_requirements() {
+        // Usage Page (0x06) must identify the FIDO Alliance page (0xF1D0)
+        assert_eq!(
+            &CTAPHID_REPORT_DESCRIPTOR[0..3],
+            &[0x06, 0xD0, 0xF1],
+            "descriptor must start with FIDO usage page"
+        );
+
+        // Usage (0x09) must declare the CTAPHID application collection (0x01)
+        assert_eq!(
+            &CTAPHID_REPORT_DESCRIPTOR[3..5],
+            &[0x09, 0x01],
+            "descriptor must declare the CTAPHID application usage"
+        );
+
+        // Ensure the descriptor defines exactly two un-numbered 64-byte reports for IN/OUT.
+        assert!(
+            CTAPHID_REPORT_DESCRIPTOR
+                .windows(2)
+                .any(|pair| pair == [0x09, 0x20]),
+            "missing FIDO DATA_IN usage"
+        );
+        assert!(
+            CTAPHID_REPORT_DESCRIPTOR
+                .windows(2)
+                .any(|pair| pair == [0x09, 0x21]),
+            "missing FIDO DATA_OUT usage"
+        );
+        assert!(
+            CTAPHID_REPORT_DESCRIPTOR
+                .windows(2)
+                .filter(|pair| pair[0] == 0x95)
+                .all(|pair| pair[1] == 0x40),
+            "report counts must remain 64 bytes"
+        );
+
+        // Report IDs (tag 0x85) are not allowed for CTAPHID devices.
+        assert!(
+            !CTAPHID_REPORT_DESCRIPTOR.contains(&0x85),
+            "descriptor must not introduce report IDs"
+        );
+
+        // The descriptor must not introduce optional Feature reports.
+        assert!(
+            !CTAPHID_REPORT_DESCRIPTOR
+                .windows(2)
+                .any(|pair| pair[0] == 0xB1 || pair[0] == 0xB2),
+            "descriptor must not define feature reports"
+        );
+
+        // The descriptor length is fixed at 34 bytes for the minimal CTAP HID layout.
+        assert_eq!(CTAPHID_REPORT_DESCRIPTOR.len(), 34);
+    }
+
+    #[test]
     fn write_event_sends_raw_descriptor_bytes() {
         use nix::unistd::{close, pipe, read};
 
