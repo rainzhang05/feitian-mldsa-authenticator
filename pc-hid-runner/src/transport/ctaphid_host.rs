@@ -19,6 +19,14 @@ const LOG_PREVIEW: usize = 8;
 const CTAP_STATUS_OK: u8 = 0x00;
 const CBOR_CMD_GET_INFO: u8 = 0x04;
 const DEFAULT_MAX_MSG_SIZE: u16 = 1200;
+const CBOR_CMD_CLIENT_PIN: u8 = 0x06;
+const CLIENT_PIN_KEY_SUBCOMMAND: u8 = 0x01;
+const CLIENT_PIN_KEY_PIN_PROTOCOL: u8 = 0x02;
+const CLIENT_PIN_SUBCMD_GET_RETRIES: u8 = 0x01;
+const CTAP2_ERR_INVALID_CBOR: u8 = 0x12;
+const CTAP2_ERR_PIN_AUTH_INVALID: u8 = 0x34;
+const CTAP2_ERR_PIN_NOT_SET: u8 = 0x36;
+const CLIENT_PIN_DEFAULT_RETRIES: u8 = 8;
 const CHANNEL_GENERATION_RETRY_LIMIT: usize = 64;
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -615,6 +623,20 @@ where
                 info!("CBOR getInfo -> OK ({} bytes)", len);
                 Some(Ok(len))
             }
+            CBOR_CMD_CLIENT_PIN => match self.write_client_pin_response(payload_len) {
+                Ok(len) => {
+                    info!("CBOR ClientPIN getRetries -> OK ({} bytes)", len);
+                    Some(Ok(len))
+                }
+                Err(status) => {
+                    let len = self.write_status_only_response(status);
+                    info!(
+                        "CBOR ClientPIN request unsupported -> CTAP2 status 0x{:02x}",
+                        status
+                    );
+                    Some(Ok(len))
+                }
+            },
             _ => None,
         }
     }
@@ -657,6 +679,254 @@ where
         self.buffer[offset] = 0x01;
         offset += 1;
         offset
+    }
+
+    fn write_client_pin_response(&mut self, payload_len: usize) -> Result<usize, u8> {
+        if payload_len < 2 {
+            warn!("ClientPIN request missing CBOR body");
+            return Err(CTAP2_ERR_INVALID_CBOR);
+        }
+
+        let reader = ClientPinRequestReader::new(&self.buffer[1..payload_len]);
+        let (sub_command, pin_protocol) = reader.read().map_err(|status| {
+            warn!(
+                "ClientPIN request parse failure -> CTAP2 status 0x{:02x}",
+                status
+            );
+            status
+        })?;
+
+        if pin_protocol != 1 {
+            warn!(
+                "ClientPIN pinProtocol {} unsupported -> CTAP2 status 0x{:02x}",
+                pin_protocol, CTAP2_ERR_PIN_AUTH_INVALID
+            );
+            return Err(CTAP2_ERR_PIN_AUTH_INVALID);
+        }
+
+        match sub_command {
+            CLIENT_PIN_SUBCMD_GET_RETRIES => Ok(self.write_client_pin_get_retries()),
+            other => {
+                warn!(
+                    "ClientPIN subCommand=0x{:02x} unsupported -> CTAP2 status 0x{:02x}",
+                    other, CTAP2_ERR_PIN_NOT_SET
+                );
+                Err(CTAP2_ERR_PIN_NOT_SET)
+            }
+        }
+    }
+
+    fn write_client_pin_get_retries(&mut self) -> usize {
+        let mut offset = 0usize;
+        self.buffer[offset] = CTAP_STATUS_OK;
+        offset += 1;
+        self.buffer[offset] = 0xA1; // map with one entry
+        offset += 1;
+        self.buffer[offset] = 0x03; // retries key
+        offset += 1;
+        self.buffer[offset] = CLIENT_PIN_DEFAULT_RETRIES;
+        offset += 1;
+        offset
+    }
+
+    fn write_status_only_response(&mut self, status: u8) -> usize {
+        self.buffer[0] = status;
+        1
+    }
+}
+
+struct ClientPinRequestReader<'a> {
+    data: &'a [u8],
+    offset: usize,
+}
+
+impl<'a> ClientPinRequestReader<'a> {
+    fn new(data: &'a [u8]) -> Self {
+        Self { data, offset: 0 }
+    }
+
+    fn read(mut self) -> Result<(u8, u8), u8> {
+        let entries = self.read_map_len()?;
+        let mut sub_command = None;
+        let mut pin_protocol = None;
+
+        for _ in 0..entries {
+            let key = self.read_unsigned()?;
+            match key {
+                CLIENT_PIN_KEY_SUBCOMMAND => {
+                    sub_command = Some(self.read_unsigned()?);
+                }
+                CLIENT_PIN_KEY_PIN_PROTOCOL => {
+                    pin_protocol = Some(self.read_unsigned()?);
+                }
+                _ => {
+                    self.skip_value()?;
+                }
+            }
+        }
+
+        let sub_command = sub_command.ok_or(CTAP2_ERR_INVALID_CBOR)?;
+        let pin_protocol = pin_protocol.ok_or(CTAP2_ERR_INVALID_CBOR)?;
+        Ok((sub_command, pin_protocol))
+    }
+
+    fn read_map_len(&mut self) -> Result<usize, u8> {
+        let byte = self.next_byte().ok_or(CTAP2_ERR_INVALID_CBOR)?;
+        match byte {
+            0xA0..=0xB7 => Ok((byte & 0x1F) as usize),
+            0xB8 => {
+                let len = self.next_byte().ok_or(CTAP2_ERR_INVALID_CBOR)? as usize;
+                Ok(len)
+            }
+            _ => Err(CTAP2_ERR_INVALID_CBOR),
+        }
+    }
+
+    fn read_unsigned(&mut self) -> Result<u8, u8> {
+        let byte = self.next_byte().ok_or(CTAP2_ERR_INVALID_CBOR)?;
+        match byte {
+            0x00..=0x17 => Ok(byte),
+            0x18 => self.next_byte().ok_or(CTAP2_ERR_INVALID_CBOR),
+            _ => Err(CTAP2_ERR_INVALID_CBOR),
+        }
+    }
+
+    fn skip_value(&mut self) -> Result<(), u8> {
+        let initial = self.next_byte().ok_or(CTAP2_ERR_INVALID_CBOR)?;
+        match initial {
+            0x00..=0x17 => Ok(()),
+            0x18 => {
+                self.next_byte().ok_or(CTAP2_ERR_INVALID_CBOR)?;
+                Ok(())
+            }
+            0x19 => {
+                self.consume(2)?;
+                Ok(())
+            }
+            0x1A => {
+                self.consume(4)?;
+                Ok(())
+            }
+            0x1B => {
+                self.consume(8)?;
+                Ok(())
+            }
+            0x40..=0x57 => {
+                let len = (initial & 0x1F) as usize;
+                self.consume(len)?;
+                Ok(())
+            }
+            0x58 => {
+                let len = self.next_byte().ok_or(CTAP2_ERR_INVALID_CBOR)? as usize;
+                self.consume(len)?;
+                Ok(())
+            }
+            0x59 => {
+                let len = self.read_u16()? as usize;
+                self.consume(len)?;
+                Ok(())
+            }
+            0x5A => {
+                let len = self.read_u32()? as usize;
+                self.consume(len)?;
+                Ok(())
+            }
+            0x60..=0x77 => {
+                let len = (initial & 0x1F) as usize;
+                self.consume(len)?;
+                Ok(())
+            }
+            0x78 => {
+                let len = self.next_byte().ok_or(CTAP2_ERR_INVALID_CBOR)? as usize;
+                self.consume(len)?;
+                Ok(())
+            }
+            0x79 => {
+                let len = self.read_u16()? as usize;
+                self.consume(len)?;
+                Ok(())
+            }
+            0x7A => {
+                let len = self.read_u32()? as usize;
+                self.consume(len)?;
+                Ok(())
+            }
+            0xA0..=0xBF => {
+                let entries = if initial <= 0xB7 {
+                    (initial & 0x1F) as usize
+                } else {
+                    let len = if initial == 0xB8 {
+                        self.next_byte().ok_or(CTAP2_ERR_INVALID_CBOR)? as usize
+                    } else {
+                        return Err(CTAP2_ERR_INVALID_CBOR);
+                    };
+                    len
+                };
+                for _ in 0..entries {
+                    self.skip_value()?;
+                    self.skip_value()?;
+                }
+                Ok(())
+            }
+            0x80..=0x9F => {
+                let items = (initial & 0x1F) as usize;
+                for _ in 0..items {
+                    self.skip_value()?;
+                }
+                Ok(())
+            }
+            0xF4..=0xF7 => Ok(()),
+            0xF9 => {
+                self.consume(2)?;
+                Ok(())
+            }
+            0xFA => {
+                self.consume(4)?;
+                Ok(())
+            }
+            0xFB => {
+                self.consume(8)?;
+                Ok(())
+            }
+            _ => Err(CTAP2_ERR_INVALID_CBOR),
+        }
+    }
+
+    fn read_u16(&mut self) -> Result<u16, u8> {
+        let bytes = self.take(2)?;
+        Ok(u16::from_be_bytes([bytes[0], bytes[1]]))
+    }
+
+    fn read_u32(&mut self) -> Result<u32, u8> {
+        let bytes = self.take(4)?;
+        Ok(u32::from_be_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]))
+    }
+
+    fn consume(&mut self, len: usize) -> Result<(), u8> {
+        if self.offset + len > self.data.len() {
+            return Err(CTAP2_ERR_INVALID_CBOR);
+        }
+        self.offset += len;
+        Ok(())
+    }
+
+    fn take(&mut self, len: usize) -> Result<&[u8], u8> {
+        if self.offset + len > self.data.len() {
+            return Err(CTAP2_ERR_INVALID_CBOR);
+        }
+        let slice = &self.data[self.offset..self.offset + len];
+        self.offset += len;
+        Ok(slice)
+    }
+
+    fn next_byte(&mut self) -> Option<u8> {
+        if self.offset >= self.data.len() {
+            None
+        } else {
+            let byte = self.data[self.offset];
+            self.offset += 1;
+            Some(byte)
+        }
     }
 }
 
