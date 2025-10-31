@@ -48,3 +48,6 @@ default-features = false
 [dev-dependencies.usbd-serial]
 version = "0.1.1"
 default-features = false
+[dependencies]
+usbd-serial = "0.2.2"
+usbd-hid = "0.8.2"
