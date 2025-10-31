@@ -402,27 +402,38 @@ fn sanitize_create_descriptor(event: &mut raw::uhid_event) {
 }
 
 fn decode_ascii_hex_in_place(buffer: &mut [u8]) -> Option<usize> {
-    let mut cleaned = Vec::with_capacity(buffer.len());
-    for &byte in buffer.iter() {
+    let mut cleaned_len = 0;
+    let mut saw_digit = false;
+    for idx in 0..buffer.len() {
+        let byte = buffer[idx];
         if byte.is_ascii_whitespace() {
             continue;
         }
-        if !byte.is_ascii_hexdigit() {
+        if byte.is_ascii_hexdigit() {
+            buffer[cleaned_len] = byte;
+            cleaned_len += 1;
+            saw_digit = true;
+            continue;
+        }
+        if saw_digit {
+            break;
+        } else {
             return None;
         }
-        cleaned.push(byte);
     }
 
-    if cleaned.len() % 2 != 0 {
+    if cleaned_len == 0 || cleaned_len % 2 != 0 {
         return None;
     }
 
     let mut out_len = 0;
-    for chunk in cleaned.chunks(2) {
-        let high = ascii_hex_value(chunk[0])?;
-        let low = ascii_hex_value(chunk[1])?;
+    let mut idx = 0;
+    while idx + 1 < cleaned_len {
+        let high = ascii_hex_value(buffer[idx])?;
+        let low = ascii_hex_value(buffer[idx + 1])?;
         buffer[out_len] = (high << 4) | low;
         out_len += 1;
+        idx += 2;
     }
 
     Some(out_len)
@@ -749,19 +760,62 @@ mod tests {
         event.type_ = raw::UHID_EVENT_TYPE_CREATE2;
         let ascii_descriptor = b"06 d0 f1 09 01 a1 01 09 20 15 00 26 ff 00 75 08 95 40 81 02 09 21 15 00 26 ff 00 75 08 95 40 91 02 c0";
         let descriptor_len = ascii_descriptor.len();
-        event.u.create2.rd_size = descriptor_len as u16;
-        event.u.create2.rd_data[..descriptor_len].copy_from_slice(ascii_descriptor);
+        let create2 = unsafe { &mut event.u.create2 };
+        create2.rd_size = descriptor_len as u16;
+        create2.rd_data[..descriptor_len].copy_from_slice(ascii_descriptor);
 
         let (read_fd, write_fd) = pipe().expect("pipe");
         write_event_blocking(write_fd, &mut event).expect("write_event");
         close(write_fd).ok();
 
+        let create2 = unsafe { &event.u.create2 };
+        assert_eq!(create2.rd_size as usize, CTAPHID_REPORT_DESCRIPTOR.len());
         assert_eq!(
-            event.u.create2.rd_size as usize,
-            CTAPHID_REPORT_DESCRIPTOR.len()
+            &create2.rd_data[..CTAPHID_REPORT_DESCRIPTOR.len()],
+            &CTAPHID_REPORT_DESCRIPTOR
         );
+
+        let mut buffer = [0u8; raw::UHID_EVENT_SIZE];
+        let mut offset = 0;
+        while offset < buffer.len() {
+            let read_bytes = read(read_fd, &mut buffer[offset..]).expect("read");
+            if read_bytes == 0 {
+                break;
+            }
+            offset += read_bytes;
+        }
+        close(read_fd).ok();
+        assert_eq!(offset, raw::UHID_EVENT_SIZE);
+
+        let data_offset = unsafe {
+            let base = (&event as *const raw::uhid_event).cast::<u8>();
+            let data = event.u.create2.rd_data.as_ptr();
+            data.offset_from(base) as usize
+        };
+        let descriptor_bytes = &buffer[data_offset..data_offset + CTAPHID_REPORT_DESCRIPTOR.len()];
+        assert_eq!(descriptor_bytes, &CTAPHID_REPORT_DESCRIPTOR);
+    }
+
+    #[test]
+    fn write_event_decodes_ascii_descriptor_with_suffix() {
+        use nix::unistd::{close, pipe, read};
+
+        let mut event = raw::uhid_event::default();
+        event.type_ = raw::UHID_EVENT_TYPE_CREATE2;
+        let ascii_descriptor = b"06 d0 f1 09 01 a1 01 09 20 15 00 26 ff 00 75 08 95 40 81 02 09 21 15 00 26 ff 00 75 08 95 40 91 02 c0\n  INPUT[INPUT]\n";
+        let descriptor_len = ascii_descriptor.len();
+        let create2 = unsafe { &mut event.u.create2 };
+        create2.rd_size = descriptor_len as u16;
+        create2.rd_data[..descriptor_len].copy_from_slice(ascii_descriptor);
+
+        let (read_fd, write_fd) = pipe().expect("pipe");
+        write_event_blocking(write_fd, &mut event).expect("write_event");
+        close(write_fd).ok();
+
+        let create2 = unsafe { &event.u.create2 };
+        assert_eq!(create2.rd_size as usize, CTAPHID_REPORT_DESCRIPTOR.len());
         assert_eq!(
-            &event.u.create2.rd_data[..CTAPHID_REPORT_DESCRIPTOR.len()],
+            &create2.rd_data[..CTAPHID_REPORT_DESCRIPTOR.len()],
             &CTAPHID_REPORT_DESCRIPTOR
         );
 
