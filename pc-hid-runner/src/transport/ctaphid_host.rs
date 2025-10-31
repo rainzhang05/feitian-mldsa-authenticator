@@ -495,11 +495,8 @@ impl<'pipe, const N: usize> CtaphidHost<'pipe, N> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::{CAPABILITY_CBOR, CAPABILITY_NMSG};
     use ctaphid_dispatch::{app::App, Channel, Dispatch, DEFAULT_MESSAGE_SIZE};
-
-    // CTAPHID capability flags (CTAP spec section 11.2.9.1.3)
-    const CAPABILITY_CBOR: u8 = 0x04; // Implements CTAPHID_CBOR
-    const CAPABILITY_NMSG: u8 = 0x08; // Does NOT implement CTAPHID_MSG
 
     struct EchoApp;
 
