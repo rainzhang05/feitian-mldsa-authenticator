@@ -538,7 +538,8 @@ mod tests {
     #[test]
     fn handles_init() {
         let (mut host, mut dispatch, mut app) = init_host();
-        host.set_capabilities(0x04);
+        // CAPABILITY_CBOR (0x04) | CAPABILITY_NMSG (0x08) = 0x0C
+        host.set_capabilities(0x0C);
 
         let mut init_packet = [0u8; 64];
         init_packet[..4].copy_from_slice(&0xffffffffu32.to_be_bytes());
@@ -554,7 +555,8 @@ mod tests {
         assert_eq!(frames[0][4] & 0x7f, Command::Init.into_u8());
         assert_eq!(frames[0][5..7], [0, 17]);
         assert_eq!(&frames[0][7..15], &[1, 2, 3, 4, 5, 6, 7, 8]);
-        assert_eq!(frames[0][16], 0x04);
+        // Verify CAPABILITY_CBOR (0x04) | CAPABILITY_NMSG (0x08) = 0x0C
+        assert_eq!(frames[0][16], 0x0C);
     }
 
     #[test]

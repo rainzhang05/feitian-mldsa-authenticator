@@ -135,7 +135,10 @@ where
         minor: 1,
         build: 0,
     });
-    host.set_capabilities(0x04);
+    // CAPABILITY_CBOR (0x04): Implements CTAPHID_CBOR
+    // CAPABILITY_NMSG (0x08): Does NOT implement CTAPHID_MSG
+    // Setting both bits prevents hosts from probing CTAPHID_MSG and enables proper CTAP2 detection
+    host.set_capabilities(0x0C);
     let dispatch = ctaphid_dispatch::Dispatch::new(responder);
     let transport = UhidTransport::new(device, host, dispatch);
     runner.exec(platform, data, transport)
