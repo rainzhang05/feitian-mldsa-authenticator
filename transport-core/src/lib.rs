@@ -8,6 +8,9 @@ use std::{
     thread,
 };
 
+pub mod ctap;
+pub mod logging;
+
 use littlefs2_core::DynFilesystem;
 use rand_chacha::ChaCha8Rng;
 use rand_core::SeedableRng as _;
