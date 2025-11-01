@@ -17,6 +17,7 @@ use ciborium::{
 };
 use ctaphid_app::{App, Command, Error};
 use hmac::{Hmac, Mac};
+use log::info;
 use p256::{
     ecdh::diffie_hellman,
     ecdsa::{signature::Signer, Signature as P256EcdsaSignature, SigningKey},
@@ -34,6 +35,8 @@ use trussed::types::consent;
 use trussed::types::{Location, Message, PathBuf};
 use trussed_mlkem::{self, Ciphertext, ParamSet as KemParamSet, SecretKey as KemSecretKey};
 use zeroize::Zeroize;
+
+use transport_core::{ctap::constants::*, logging::HexOption};
 
 #[cfg(test)]
 use std::sync::Mutex;
@@ -176,33 +179,6 @@ fn decrypt_shared_secret(key: &[u8; 32], ciphertext: &[u8]) -> Result<Vec<u8>, u
         .map_err(|_| CTAP1_ERR_INVALID_PARAMETER)?;
     Ok(plaintext.to_vec())
 }
-
-const CTAP_CMD_MAKE_CREDENTIAL: u8 = 0x01;
-const CTAP_CMD_GET_ASSERTION: u8 = 0x02;
-const CTAP_CMD_GET_INFO: u8 = 0x04;
-const CTAP_CMD_CLIENT_PIN: u8 = 0x06;
-const CTAP_CMD_GET_NEXT_ASSERTION: u8 = 0x08;
-const CTAP_CMD_CREDENTIAL_MANAGEMENT: u8 = 0x0A;
-
-const CTAP2_OK: u8 = 0x00;
-const CTAP2_ERR_INVALID_CBOR: u8 = 0x12;
-const CTAP2_ERR_MISSING_PARAMETER: u8 = 0x14;
-const CTAP2_ERR_CREDENTIAL_EXCLUDED: u8 = 0x19;
-const CTAP2_ERR_UNSUPPORTED_ALGORITHM: u8 = 0x26;
-const CTAP2_ERR_INVALID_OPTION: u8 = 0x2C;
-const CTAP2_ERR_NO_CREDENTIALS: u8 = 0x2E;
-const CTAP1_ERR_INVALID_PARAMETER: u8 = 0x2D;
-const CTAP2_ERR_KEEPALIVE_CANCEL: u8 = 0x2D;
-const CTAP2_ERR_NOT_ALLOWED: u8 = 0x30;
-const CTAP2_ERR_PIN_INVALID: u8 = 0x31;
-const CTAP2_ERR_PIN_BLOCKED: u8 = 0x32;
-const CTAP2_ERR_PIN_AUTH_INVALID: u8 = 0x33;
-const CTAP2_ERR_PIN_AUTH_BLOCKED: u8 = 0x34;
-const CTAP2_ERR_PIN_NOT_SET: u8 = 0x35;
-const CTAP2_ERR_PIN_POLICY_VIOLATION: u8 = 0x37;
-const CTAP2_ERR_PROCESSING: u8 = 0x21;
-const CTAP2_ERR_PUAT_REQUIRED: u8 = 0x36;
-const CTAP2_ERR_UNAUTHORIZED_PERMISSION: u8 = 0x40;
 
 const MAX_PIN_RETRIES: u8 = 8;
 const MAX_PIN_FAILURES_BEFORE_BLOCK: u8 = 3;
@@ -1323,9 +1299,14 @@ where
             0x03 => self.client_pin_set_pin(protocol, &map),
             0x04 => self.client_pin_change_pin(protocol, &map),
             0x05 => self.client_pin_get_token_legacy(protocol, &map),
+            0x07 => Err(CTAP2_ERR_UNSUPPORTED_OPTION),
             0x09 => self.client_pin_get_token_with_permissions(protocol, &map),
             _ => Err(CTAP1_ERR_INVALID_PARAMETER),
         }
+    }
+
+    fn handle_bio_enrollment(&mut self, _payload: &[u8]) -> Result<Vec<u8>, u8> {
+        Err(CTAP1_ERR_INVALID_COMMAND)
     }
 
     fn client_pin_get_retries(&mut self) -> Result<Vec<u8>, u8> {
@@ -1497,6 +1478,46 @@ where
 
     fn map_get<'a>(map: &'a [(Value, Value)], key: Value) -> Option<&'a Value> {
         map.iter().find(|(k, _)| *k == key).map(|(_, v)| v)
+    }
+
+    fn extract_subcommand_and_pin_protocol_for_logging(payload: &[u8]) -> (Option<u8>, Option<u8>) {
+        use std::io::Cursor;
+
+        let mut sub_command = None;
+        let mut pin_protocol = None;
+
+        if payload.is_empty() {
+            return (sub_command, pin_protocol);
+        }
+
+        if let Ok(Value::Map(entries)) = from_reader(Cursor::new(payload)) {
+            for (key, value) in entries {
+                if let Value::Integer(key_int) = key {
+                    let key_val: i128 = key_int.into();
+                    match key_val {
+                        1 => {
+                            if let Value::Integer(sub_int) = value {
+                                let value: i128 = sub_int.into();
+                                if (0..=u8::MAX as i128).contains(&value) {
+                                    sub_command = Some(value as u8);
+                                }
+                            }
+                        }
+                        2 => {
+                            if let Value::Integer(pin_int) = value {
+                                let value: i128 = pin_int.into();
+                                if (0..=u8::MAX as i128).contains(&value) {
+                                    pin_protocol = Some(value as u8);
+                                }
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+            }
+        }
+
+        (sub_command, pin_protocol)
     }
 
     fn cm_hash_rp_id(rp_id: &str) -> Vec<u8> {
@@ -2754,22 +2775,43 @@ where
                 if request.is_empty() {
                     return Err(Error::InvalidLength);
                 }
-                let subcommand = request[0];
+                let ctap_cmd = request[0];
                 let payload = &request[1..];
-                let result = match subcommand {
+                let result = match ctap_cmd {
                     CTAP_CMD_GET_INFO => self.handle_get_info(),
                     CTAP_CMD_MAKE_CREDENTIAL => self.handle_make_credential(payload),
                     CTAP_CMD_GET_ASSERTION => self.handle_get_assertion(payload),
                     CTAP_CMD_GET_NEXT_ASSERTION => self.handle_get_next_assertion(),
                     CTAP_CMD_CLIENT_PIN => self.handle_client_pin(payload),
                     CTAP_CMD_CREDENTIAL_MANAGEMENT => self.handle_credential_management(payload),
+                    CTAP_CMD_BIO_ENROLLMENT => self.handle_bio_enrollment(payload),
                     _ => Err(CTAP2_ERR_INVALID_CBOR),
                 };
 
-                let message = match result {
-                    Ok(bytes) => bytes,
-                    Err(status) => vec![status],
+                let (message, status) = match result {
+                    Ok(bytes) => {
+                        let status = bytes.first().copied().unwrap_or(CTAP2_OK);
+                        (bytes, status)
+                    }
+                    Err(status) => (vec![status], status),
                 };
+
+                let (sub_command, pin_protocol) = match ctap_cmd {
+                    CTAP_CMD_CLIENT_PIN | CTAP_CMD_BIO_ENROLLMENT => {
+                        Self::extract_subcommand_and_pin_protocol_for_logging(payload)
+                    }
+                    _ => (None, None),
+                };
+
+                info!(
+                    "CTAP2 cmd=0x{ctap_cmd:02x} status=0x{:02x} sub={} pinProtocol={} req_bcnt={} resp_bcnt={} resp_payload_len={}",
+                    status,
+                    HexOption(sub_command),
+                    HexOption(pin_protocol),
+                    request.len(),
+                    message.len(),
+                    message.len(),
+                );
 
                 response
                     .extend_from_slice(&message)
