@@ -148,7 +148,3 @@ The gadget runner writes its configuration to `/sys/kernel/config/usb_gadget/<ga
 - `--gadget-usb-version <hex>` — USB specification version (bcdUSB) to advertise; defaults to `0x0200` (USB 2.0).
 
 Like the UHID runner, the gadget backend persists state in the configured `--state-dir` and shares all other command-line options (AAGUID, VID/PID, PQC policy, and identity strings). To switch back to the legacy `/dev/uhid` transport, pass `--backend uhid` explicitly.
-
-## Validation
-
-Follow the steps in [`docs/validation.md`](docs/validation.md) to use WebAuthn registration, concurrent CTAP sessions, and keepalive behaviour before distributing new builds.
