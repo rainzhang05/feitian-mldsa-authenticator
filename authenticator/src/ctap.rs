@@ -1873,7 +1873,6 @@ where
             Value::Array(vec![
                 Value::Text("FIDO_2_1".into()),
                 Value::Text("FIDO_2_0".into()),
-                Value::Text("U2F_V2".into()),
             ]),
         ));
         map.push((
@@ -1892,12 +1891,10 @@ where
         let options = canonical_map(vec![
             (Value::Text("rk".into()), Value::Bool(true)),
             (Value::Text("up".into()), Value::Bool(true)),
+            (Value::Text("uv".into()), Value::Bool(false)),
             (Value::Text("credMgmt".into()), Value::Bool(true)),
             (Value::Text("pinUvAuthToken".into()), Value::Bool(true)),
-            (
-                Value::Text("clientPin".into()),
-                Value::Bool(self.pin_state.is_set()),
-            ),
+            (Value::Text("clientPin".into()), Value::Bool(true)),
         ]);
         map.push((Value::Integer(Integer::from(4)), options));
 
@@ -2813,6 +2810,7 @@ where
                     message.len(),
                 );
 
+                response.clear();
                 response
                     .extend_from_slice(&message)
                     .map_err(|_| Error::InvalidLength)
