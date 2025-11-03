@@ -350,8 +350,19 @@ where
         apps: &mut [&mut dyn App<'interrupt, N>],
     ) -> bool {
         let mut did_work = false;
-        while dispatch.poll(apps) {
+        loop {
+            let progressed = dispatch.poll(apps);
+            if !progressed {
+                break;
+            }
+
             did_work = true;
+
+            if matches!(self.state, State::WaitingOnAuthenticator { .. })
+                && matches!(self.requester.state(), InterchangeState::Responded)
+            {
+                break;
+            }
         }
 
         if let State::WaitingOnAuthenticator { request, .. } = self.state {
