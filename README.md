@@ -124,7 +124,3 @@ Useful flags:
 - `--pqc-policy <prefer|required|disabled>` — choose the PQC PIN/UV transport policy
 
 Omit `--foreground` to run the service as a background daemon. The CLI also exposes `status` and `stop` subcommands that inspect or terminate that daemonised instance.
-
-## Validation
-
-Follow the steps in [`docs/validation.md`](docs/validation.md) to use WebAuthn registration, concurrent CTAP sessions, and keepalive behaviour before distributing new builds.
