@@ -17,6 +17,7 @@ use interchange::State as InterchangeState;
 const PACKET_SIZE: usize = CTAPHID_FRAME_LEN;
 const LOG_PREVIEW: usize = 8;
 const CHANNEL_GENERATION_RETRY_LIMIT: usize = 64;
+const APP_RESPONSE_TIMEOUT_MS: u64 = 2_000;
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct Version {
@@ -89,6 +90,7 @@ enum State {
     },
     WaitingOnAuthenticator {
         request: Request,
+        started_at: u64,
     },
 }
 
@@ -101,6 +103,7 @@ enum AuthenticatorError {
     InvalidSeq,
     Timeout,
     Canceled,
+    Other,
 }
 
 impl From<AuthenticatorError> for u8 {
@@ -113,6 +116,7 @@ impl From<AuthenticatorError> for u8 {
             AuthenticatorError::ChannelBusy => 0x06,
             AuthenticatorError::InvalidChannel => 0x0B,
             AuthenticatorError::Canceled => 0x2D,
+            AuthenticatorError::Other => 0x0C,
         }
     }
 }
@@ -206,7 +210,10 @@ where
             };
 
             if !matches!(self.state, State::Idle) {
-                if let State::WaitingOnAuthenticator { request: current } = self.state {
+                if let State::WaitingOnAuthenticator {
+                    request: current, ..
+                } = self.state
+                {
                     if command == Command::Cancel && channel == current.channel {
                         self.cancel_ongoing_activity();
                         return;
@@ -299,10 +306,28 @@ where
                 self.state = State::Idle;
             }
         }
+
+        if let State::WaitingOnAuthenticator {
+            request,
+            started_at,
+        } = self.state
+        {
+            if timestamp_ms >= started_at + APP_RESPONSE_TIMEOUT_MS {
+                debug!(
+                    "Authenticator timeout cid={:08x} waited={}ms",
+                    request.channel,
+                    timestamp_ms.saturating_sub(started_at)
+                );
+                let _ = self.requester.cancel();
+                self.enqueue_error_on_channel(request.channel, AuthenticatorError::Other);
+                self.state = State::Idle;
+                self.needs_keepalive = false;
+            }
+        }
     }
 
     pub fn send_keepalive(&mut self, waiting_for_user_presence: bool) -> bool {
-        if let State::WaitingOnAuthenticator { request } = self.state {
+        if let State::WaitingOnAuthenticator { request, .. } = self.state {
             if !self.needs_keepalive {
                 return false;
             }
@@ -329,26 +354,41 @@ where
             did_work = true;
         }
 
-        if let State::WaitingOnAuthenticator { request } = self.state {
+        if let State::WaitingOnAuthenticator { request, .. } = self.state {
             if let Ok(response) = self.requester.response() {
                 let outcome = match &response.0 {
                     Err(AppError::InvalidCommand) => Some(Err(AuthenticatorError::InvalidCommand)),
                     Err(AppError::InvalidLength) => Some(Err(AuthenticatorError::InvalidLength)),
-                    Err(AppError::NoResponse) => Some(Err(AuthenticatorError::InvalidCommand)),
+                    Err(AppError::NoResponse) => Some(Err(AuthenticatorError::Other)),
                     Ok(bytes) => {
                         let len = bytes.len();
-                        self.buffer[..len].copy_from_slice(bytes);
-                        Some(Ok(len))
+                        if len > self.buffer.len() {
+                            Some(Err(AuthenticatorError::InvalidLength))
+                        } else {
+                            self.buffer[..len].copy_from_slice(bytes);
+                            Some(Ok(len))
+                        }
                     }
                 };
                 if let Some(result) = outcome {
                     match result {
                         Ok(len) => {
+                            debug!(
+                                "App response cid={:08x} cmd=0x{:02x} len={len}",
+                                request.channel,
+                                request.command.into_u8()
+                            );
                             let response = Response::from_request_and_size(request, len);
                             self.enqueue_response(response);
                             did_work = true;
                         }
                         Err(error) => {
+                            debug!(
+                                "App error cid={:08x} cmd=0x{:02x} -> 0x{:02x}",
+                                request.channel,
+                                request.command.into_u8(),
+                                u8::from(error)
+                            );
                             self.start_sending_error(request, error);
                             did_work = true;
                         }
@@ -437,7 +477,10 @@ where
     }
 
     fn handle_cancel(&mut self, request: Request) {
-        if let State::WaitingOnAuthenticator { request: current } = self.state {
+        if let State::WaitingOnAuthenticator {
+            request: current, ..
+        } = self.state
+        {
             if current.channel == request.channel {
                 let _ = self.requester.cancel();
                 self.enqueue_error_on_channel(current.channel, AuthenticatorError::Canceled);
@@ -464,9 +507,20 @@ where
                 if matches!(self.requester.state(), InterchangeState::Responded) {
                     let _ = self.requester.take_response();
                 }
+                if request.command == Command::Cbor {
+                    let ctap_cmd = bytes.first().copied().unwrap_or_default();
+                    debug!(
+                        "Forwarding CBOR cid={:08x} ctap=0x{ctap_cmd:02x} payload_len={}",
+                        request.channel,
+                        bytes.len()
+                    );
+                }
                 match self.requester.request((request.command, bytes)) {
                     Ok(()) => {
-                        self.state = State::WaitingOnAuthenticator { request };
+                        self.state = State::WaitingOnAuthenticator {
+                            request,
+                            started_at: self.last_millis,
+                        };
                         self.started_processing = true;
                         self.needs_keepalive = request.command == Command::Cbor;
                     }
@@ -482,7 +536,7 @@ where
     }
 
     fn cancel_ongoing_activity(&mut self) {
-        if let State::WaitingOnAuthenticator { request } = self.state {
+        if let State::WaitingOnAuthenticator { request, .. } = self.state {
             let _ = self.requester.cancel();
             self.enqueue_error_on_channel(request.channel, AuthenticatorError::Canceled);
             self.state = State::Idle;
