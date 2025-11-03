@@ -11,67 +11,110 @@ Highlights
 
 ## Tech stack
 
-- Languages: Rust (core, runner, USB/IP), C (ML-DSA implmenetation in liboqs)
-- Frameworks/Crates:
-  - Trussed (secure application framework)
-  - ctaphid-dispatch (CTAP2 frame dispatcher)
-  - nix (low-level syscalls and `/dev/uhid` access)
-  - libudev (hidraw enumeration)
-  - usbip-device (USB/IP device-side stack; patched locally, optional)
-- Tools:
-  - libfido2 (fido2-token) or python-fido2 (optional, for testing)
-  - USB/IP userspace (usbip) + kernel module (vhci-hcd) — only when exercising the legacy runner
+- Languages and FFI: Rust across the workspace crates, C via liboqs for ML-DSA and ML-KEM bindings consumed by `trussed-mldsa` and `trussed-mlkem`.
+- Workspace crates:
+  - `authenticator` - Trussed application that implements CTAP2/CTAPHID and CCID flows on top of the PQC wrappers.
+  - `transport-core` - shared storage/state crate providing littlefs-backed persistence, attestation helpers, and CTAP/CCID glue code.
+  - `pc-hid-runner` - host runner exposing `/dev/uhid` and USB gadget backends with daemon/service management.
+  - `pc-usbip-runner` (`trussed-usbip`) - legacy USB/IP transport kept for regression coverage.
+  - `trussed-mldsa` & `trussed-mlkem` - thin zeroise-aware wrappers around liboqs ML-DSA/ML-KEM exports.
+- Key ecosystem crates: Trussed (patched to commit `024e0ec`), `ctaphid-dispatch`, `usbd-ctaphid`, `usbd-ccid`, `apdu-dispatch`, `littlefs2`, `ciborium`, `serde`, `rcgen`, `p256`, `chacha20`, `rand_chacha`, `nix`, `signal-hook`, `daemonize`, and `clap`.
+- Tooling for validation: `libfido2`/`python-fido2` for host interoperability tests, USB/IP utilities for the legacy backend, and Linux USB gadget stack components when exercising real HID gadgets.
 
 ## Patches and runner tools
 
-- Patched usbip-device (vendored under patches/usbip-device) to:
-  - Cap IN transfer sizes to host-requested length (buffer leftovers)
-  - Report device speed explicitly (Full-Speed vs High-Speed)
-  - Improve EP0 (control) handling by clearing stale IN data on new SETUP
-- PC USB/IP runner (pc-usbip-runner):
-  - Exposes the authenticator as a virtual USB device
-  - Can set the reported USB speed (FS/HS)
-  - Handles CTAPHID/CCID endpoints and event loop/keepalive
+- Crate patches:
+  - `trussed` is pinned to upstream commit `024e0ec` for the Trussed features used by the authenticator stack.
+  - `usbip-device` is vendored under `patches/usbip-device` with fixes for packet sizing, speed reporting, and EP0 hygiene to stabilise the legacy USB/IP transport.
+  - `ssmarshal` lives under `patches/ssmarshal` to guarantee the `no_std` feature set and serde 1.0 compatibility relied on by `transport-core`.
+- Runner tooling:
+  - `pc-hid-runner` offers `/dev/uhid` and USB gadget backends, foreground/background service modes, permission checks, and helpers aligned with the packaged `contrib/udev` rule and `systemd` service unit.
+  - `pc-usbip-runner` continues to expose the authenticator over USB/IP, with examples under `pc-usbip-runner/examples/` for CTAPHID and CCID exercise.
 
 ## Project structure
 
-- pc-hid-runner/ — Host-side HID runner that bridges `/dev/uhid` to the authenticator stack
-- pc-usbip-runner/ — Legacy USB/IP runner that simulates a USB authenticator device
-- patches/usbip-device/ — Vendored/modified usbip-device crate used by the runner
-- docs/ — Documentation, notes, and troubleshooting (if present)
-- Other Rust/C crates — Core authenticator logic, CTAP2 handlers, and ML-DSA crypto
-  - Typical layout: Cargo workspaces for Rust crates, and a C library for ML-DSA
+```
+.
+|-- authenticator/
+|   |-- Cargo.toml
+|   `-- src/
+|       |-- ctap.rs
+|       |-- ctap/
+|       |   `-- tests.rs
+|       `-- lib.rs
+|-- contrib/
+|   |-- systemd/
+|   |   `-- feitian-authenticator.service
+|   `-- udev/
+|       `-- 70-feitian-authenticator.rules
+|-- download-ripgrepSCJSfZ/
+|   `-- tmp-file
+|-- patches/
+|   |-- ssmarshal/
+|   `-- usbip-device/
+|-- pc-hid-runner/
+|   |-- Cargo.toml
+|   `-- src/
+|       |-- bin/
+|       |   `-- authenticator.rs
+|       |-- cli.rs
+|       |-- gadget.rs
+|       |-- lib.rs
+|       |-- permissions.rs
+|       |-- service.rs
+|       |-- transport/
+|       |   |-- ctaphid_host.rs
+|       |   `-- mod.rs
+|       `-- uhid.rs
+|-- pc-usbip-runner/
+|   |-- Cargo.toml
+|   |-- Dockerfile
+|   |-- Makefile
+|   |-- README.md
+|   |-- examples/
+|   `-- src/
+|-- prebuilt_liboqs/
+|   |-- linux-aarch64/
+|   |   |-- include/oqs/
+|   |   `-- lib/
+|   `-- linux-x86_64/
+|       |-- include/oqs/
+|       `-- lib/
+|-- target/
+|   `-- ... (build artifacts)
+|-- transport-core/
+|   |-- Cargo.toml
+|   `-- src/
+|       |-- ctap/
+|       |-- lib.rs
+|       |-- logging.rs
+|       `-- state.rs
+|-- trussed-mldsa/
+|   |-- Cargo.toml
+|   |-- build.rs
+|   `-- src/lib.rs
+|-- trussed-mlkem/
+|   |-- Cargo.toml
+|   |-- build.rs
+|   `-- src/lib.rs
+|-- Cargo.toml
+`-- README.md
+```
 
 ## Dependencies
 
-System (Ubuntu/Debian)
-- Required:
-  - Rust toolchain (rustup recommended): rustc, cargo
-  - C toolchain: build-essential (or clang)
-  - libclang-dev (for bindgen, if used)
-  - pkg-config
-  - libudev-dev
-- Recommended for testing:
-  - libfido2-tools (provides fido2-token)
-- usbip + vhci-hcd (only required for the legacy USB/IP runner)
-- Linux USB gadget stack (libcomposite, usb_f_hid, and a UDC such as dummy_hcd) when running the gadget backend
+**System (Linux host)**
+- Rust toolchain via `rustup` (2021 edition-compatible toolchain recommended).
+- A C toolchain and binutils (`nm`) for linking against liboqs from `prebuilt_liboqs/`.
+- Optional testing utilities: `libfido2-tools`, `python3-fido2`, and the USB/IP userspace (`usbip`, `vhci-hcd`) for exercising the legacy transport.
+- USB gadget support (configfs, `usb_f_hid`, `dummy_hcd` or a physical UDC) when running the gadget backend.
+- Service integration helpers: `systemd` (to deploy `contrib/systemd/feitian-authenticator.service`) and udev (for `contrib/udev/70-feitian-authenticator.rules`).
 
-Rust crates of note:
-- `nix` (with the `user` feature enabled for permission checks)
-- `libudev` (safe bindings to enumerate hidraw devices)
-- `ctaphid-dispatch` (frames CTAP messages for the host transport)
-
-Install (example on Ubuntu/Debian)
-```bash
-# Rust (recommended):
-curl https://sh.rustup.rs -sSf | sh
-
-# System packages:
-sudo apt update
-sudo apt install -y build-essential pkg-config libclang-dev libudev-dev
-# Optional testing and legacy-runner tools:
-sudo apt install -y libfido2-1 libfido2-dev libfido2-tools usbip python3-pip
-```
+**Rust crates of note**
+- Transport and protocol layers: `ctaphid-dispatch`, `usbd-ctaphid`, `usbd-ccid`, `apdu-dispatch`, `transport-core`.
+- Storage and serialization: `littlefs2`, `littlefs2-core`, `ciborium`, vendored `ssmarshal`, `serde`.
+- Host runner and orchestration: `nix`, `signal-hook`, `daemonize`, `clap`, `heapless-bytes`.
+- Cryptography: `trussed` (patched), `trussed-mldsa`, `trussed-mlkem`, `p256`, `rcgen`, `sha2`, `chacha20`, `rand_chacha`, `zeroize`.
 
 ## Build
 
