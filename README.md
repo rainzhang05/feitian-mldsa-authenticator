@@ -187,8 +187,7 @@ Omit `--foreground` to run the service as a background daemon. The CLI also expo
 The default backend provisions a configfs USB device that surfaces a real HID interface at `/dev/hidg0`. This requires the Linux USB gadget stack and an available USB Device Controller (UDC). On physical hardware, the UDC is provided by the SoC; on PCs or VMs you can load the `dummy_hcd` module to emulate one.
 
 ```bash
-sudo RUST_LOG=info $(which cargo) run -p pc-hid-runner -- \
-    start --gadget-udc dummy_udc.0 --foreground
+sudo RUST_LOG=info $(which cargo) run -p pc-hid-runner -- start --gadget-udc dummy_udc.0 --foreground
 ```
 
 The runner automatically loads the required gadget kernel modules (`libcomposite`, `usb_f_hid`, and `dummy_hcd`), cleans up any
