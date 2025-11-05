@@ -120,6 +120,7 @@ curl https://sh.rustup.rs -sSf | sh
 # System packages:
 sudo apt update
 sudo apt install -y build-essential pkg-config libclang-dev libudev-dev
+
 # Optional testing and legacy-runner tools:
 sudo apt install -y libfido2-1 libfido2-dev libfido2-tools usbip python3-pip
 ```
