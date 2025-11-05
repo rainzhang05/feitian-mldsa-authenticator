@@ -12,7 +12,7 @@ Highlights
 ## Tech stack
 
 - Languages and FFI: Rust across the workspace crates, C via liboqs for ML-DSA and ML-KEM bindings consumed by `trussed-mldsa` and `trussed-mlkem`.
-- Workspace crates:
+- Core crates:
   - `authenticator` - Trussed application that implements CTAP2/CTAPHID and CCID flows on top of the PQC wrappers.
   - `transport-core` - shared storage/state crate providing littlefs-backed persistence, attestation helpers, and CTAP/CCID glue code.
   - `pc-hid-runner` - host runner exposing `/dev/uhid` and USB gadget backends with daemon/service management.
@@ -116,15 +116,26 @@ Highlights
 - Host runner and orchestration: `nix`, `signal-hook`, `daemonize`, `clap`, `heapless-bytes`.
 - Cryptography: `trussed` (patched), `trussed-mldsa`, `trussed-mlkem`, `p256`, `rcgen`, `sha2`, `chacha20`, `rand_chacha`, `zeroize`.
 
-## Build
-
-At the repository root:
+**Install (example on Ubuntu/Debian)**
 ```bash
-# Debug build
-cargo build
+# Rust (recommended):
+curl https://sh.rustup.rs -sSf | sh
 
-# Release build
-cargo build --release
+# System packages:
+sudo apt update
+sudo apt install -y build-essential pkg-config libclang-dev libudev-dev \
+    libfido2-1 libfido2-dev libfido2-tools usbip python3-pip \
+    linux-modules-extra-$(uname -r)
+
+# Load USB gadget modules (required for virtual HID devices)
+sudo modprobe libcomposite
+sudo modprobe usb_f_hid
+sudo modprobe dummy_hcd
+
+## Build
+# At the repository root:
+cargo build          # Debug build
+cargo build --release  # Release build
 ```
 
 ## Select a liboqs bundle
@@ -141,7 +152,7 @@ export LD_LIBRARY_PATH="$PWD/prebuilt_liboqs/linux-aarch64/lib:${LD_LIBRARY_PATH
 
 If you build liboqs yourself, ensure the resulting shared library matches the target architecture of the runner binary.
 
-## Run the HID runner
+## Run the HID runner (Without USB Gadget)
 
 The HID runner provisions a virtual authenticator through `/dev/uhid`, creating a `hidraw` node that browsers can use transparently. From the root of the repository: 
 ```bash
