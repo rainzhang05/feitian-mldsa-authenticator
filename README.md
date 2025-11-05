@@ -9,19 +9,25 @@ Highlights
 
 ## Tech stack
 
-- Languages: Rust across all workspace crates; C for the liboqs ML-DSA/ML-KEM backends; a small amount of shell/systemd glue under `contrib/`.
-- Core crates: Trussed application framework, shared `transport-core` services, Rust wrappers `trussed-mldsa` and `trussed-mlkem`, CTAP/HID plumbing via `ctaphid-dispatch` + `usbd-ctaphid`, CCID support via `usbd-ccid`, CBOR tooling with `ciborium`, persistent storage via `littlefs2`, and zero-copy buffers using `heapless`/`heapless-bytes`.
-- Runner/runtime: `pc-hid-runner` (UHID daemon with Clap 4 CLI, `daemonize`, permission checks via `nix` + `libudev`), optional `pc-usbip-runner` backend built on `transport-core` and `usb-device`, plus plug-in support for USB/IP and CCID transports.
-- PQC + crypto: Prebuilt `liboqs` bundles surfaced through the `trussed-mldsa` and `trussed-mlkem` wrappers, classical ECC via `p256`, attestation scaffolding using `rcgen`, randomness sourced from `rand`/`rand_chacha`.
-- Tooling: Companion tooling includes `libfido2`, `python-fido2`, and USB/IP (`usbip`, `vhci-hcd`) for exercising the runners end-to-end.
+- Languages and FFI: Rust across the workspace crates, C via liboqs for ML-DSA and ML-KEM bindings consumed by `trussed-mldsa` and `trussed-mlkem`.
+- Core crates:
+  - `authenticator` - Trussed application that implements CTAP2/CTAPHID and CCID flows on top of the PQC wrappers.
+  - `transport-core` - shared storage/state crate providing littlefs-backed persistence, attestation helpers, and CTAP/CCID glue code.
+  - `pc-hid-runner` - host runner exposing `/dev/uhid`. 
+  - `pc-usbip-runner` (`trussed-usbip`) - legacy USB/IP transport kept for regression coverage.
+  - `trussed-mldsa` & `trussed-mlkem` - thin zeroise-aware wrappers around liboqs ML-DSA/ML-KEM exports.
+- Key ecosystem crates: Trussed (patched to commit `024e0ec`), `ctaphid-dispatch`, `usbd-ctaphid`, `usbd-ccid`, `apdu-dispatch`, `littlefs2`, `ciborium`, `serde`, `rcgen`, `p256`, `chacha20`, `rand_chacha`, `nix`, `signal-hook`, `daemonize`, and `clap`.
+- Tooling for validation: `libfido2`/`python-fido2` for host interoperability tests, and USB/IP utilities for the legacy backend. 
 
 ## Patches and runner tools
 
-- `pc-hid-runner/`: main host service; provides start/stop/status CLI, daemonizes with log output, verifies `/dev/uhid` permissions, toggles manual user presence, attestation suppression, PQC policy, and can swap to a USB/IP backend when built with the `usbip-backend` feature.
-- `pc-usbip-runner/`: legacy and testing runner backed by the `trussed-usbip` crate, instantiating CTAPHID and optional CCID endpoints over USB/IP while reusing `transport-core` state management.
-- `patches/usbip-device/`: vendored fork of the upstream crate wired in through `[patch.crates-io]`, retaining support for capped IN transfers, explicit speed reporting, and clean EP0 SETUP handling expected by the runners.
-- `patches/ssmarshal/`: local copy of `ssmarshal` that keeps the `no_std` serialization path Trussed relies on while avoiding upstream API drift.
-- `contrib/`: deployment assets including `systemd` service units and `udev` rules for hardened HID permissions.
+- Crate patches:
+  - `trussed` is pinned to upstream commit `024e0ec` for the Trussed features used by the authenticator stack.
+  - `usbip-device` is vendored under `patches/usbip-device` with fixes for packet sizing, speed reporting, and EP0 hygiene to stabilise the legacy USB/IP transport.
+  - `ssmarshal` lives under `patches/ssmarshal` to guarantee the `no_std` feature set and serde 1.0 compatibility relied on by `transport-core`.
+- Runner tooling:
+  - `pc-hid-runner` offers `/dev/uhid`, foreground/background service modes, permission checks, and helpers aligned with the packaged `contrib/udev` rule and `systemd` service unit.
+  - `pc-usbip-runner (patch)` continues to expose the authenticator over USB/IP, with examples under `pc-usbip-runner/examples/` for CTAPHID and CCID exercise.
 
 ## Project structure
 
@@ -94,17 +100,17 @@ Highlights
 
 ## Dependencies
 
-System (Ubuntu/Debian)
-- Required: Rust toolchain (rustup recommended), C toolchain (`build-essential` or `clang`), `pkg-config`, `libudev-dev`, `libclang-dev`.
-- Optional/testing: `libfido2-tools`, `python3-pip` + `python-fido2`, `usbip` with the `vhci-hcd` kernel module, `systemd` if you plan to install the provided unit.
-- Kernel modules: `uhid` for the HID runner, `vhci-hcd` when exercising the USB/IP backend.
+**System (Linux host)**
+- Rust toolchain via `rustup` (2021 edition-compatible toolchain recommended).
+- A C toolchain and binutils (`nm`) for linking against liboqs from `prebuilt_liboqs/`.
+- Optional testing utilities: `libfido2-tools`, `python3-fido2`, and the USB/IP userspace (`usbip`, `vhci-hcd`) for exercising the legacy transport.
+- Service integration helpers: `systemd` (to deploy `contrib/systemd/feitian-authenticator.service`) and udev (for `contrib/udev/70-feitian-authenticator.rules`).
 
-Rust crates of note:
-- `transport-core` (shared CTAP/CCID state, storage, and attestation helpers).
-- `trussed-mldsa` / `trussed-mlkem` (liboqs-backed PQC bindings).
-- `littlefs2`, `littlefs2-core`, `interchange`, `heapless`, `heapless-bytes` (persistent storage and zero-copy data paths).
-- `rcgen`, `p256`, `rand`, `rand_chacha`, `ciborium` (cryptography, attestation, and CBOR support).
-- `clap`, `daemonize`, `nix`, `libudev`, `signal-hook` (runner CLI and host integration).
+**Rust crates of note**
+- Transport and protocol layers: `ctaphid-dispatch`, `usbd-ctaphid`, `usbd-ccid`, `apdu-dispatch`, `transport-core`.
+- Storage and serialization: `littlefs2`, `littlefs2-core`, `ciborium`, vendored `ssmarshal`, `serde`.
+- Host runner and orchestration: `nix`, `signal-hook`, `daemonize`, `clap`, `heapless-bytes`.
+- Cryptography: `trussed` (patched), `trussed-mldsa`, `trussed-mlkem`, `p256`, `rcgen`, `sha2`, `chacha20`, `rand_chacha`, `zeroize`.
 
 Install (example on Ubuntu/Debian)
 ```bash
@@ -119,14 +125,9 @@ sudo apt install -y libfido2-1 libfido2-dev libfido2-tools usbip python3-pip
 ```
 
 ## Build
-
-At the repository root:
-```bash
-# Debug build
-cargo build
-
-# Release build
-cargo build --release
+# At the repository root:
+cargo build          # Debug build
+cargo build --release  # Release build
 ```
 
 ## Select a liboqs bundle
