@@ -27,39 +27,69 @@ Highlights
 
 ```
 .
-├── authenticator/
-│   ├── Cargo.toml
-│   └── src/
-│       ├── ctap.rs
-│       └── ctap/
-│           └── tests.rs
-├── contrib/
-│   ├── systemd/
-│   └── udev/
-├── patches/
-│   ├── ssmarshal/
-│   └── usbip-device/
-├── pc-hid-runner/
-│   ├── Cargo.toml
-│   └── src/
-├── pc-usbip-runner/
-│   ├── Cargo.toml
-│   └── src/
-├── prebuilt_liboqs/
-│   ├── linux-aarch64/
-│   └── linux-x86_64/
-├── transport-core/
-│   ├── Cargo.toml
-│   └── src/
-├── trussed-mldsa/
-│   ├── Cargo.toml
-│   └── src/
-├── trussed-mlkem/
-│   ├── Cargo.toml
-│   └── src/
-├── Cargo.lock
-├── Cargo.toml
-└── README.md
+|-- authenticator/
+|   |-- Cargo.toml
+|   `-- src/
+|       |-- ctap.rs
+|       |-- ctap/
+|       |   `-- tests.rs
+|       `-- lib.rs
+|-- contrib/
+|   |-- systemd/
+|   |   `-- feitian-authenticator.service
+|   `-- udev/
+|       `-- 70-feitian-authenticator.rules
+|-- download-ripgrepSCJSfZ/
+|   `-- tmp-file
+|-- patches/
+|   |-- ssmarshal/
+|   `-- usbip-device/
+|-- pc-hid-runner/
+|   |-- Cargo.toml
+|   `-- src/
+|       |-- bin/
+|       |   `-- authenticator.rs
+|       |-- cli.rs
+|       |-- lib.rs
+|       |-- permissions.rs
+|       |-- service.rs
+|       |-- transport/
+|       |   |-- ctaphid_host.rs
+|       |   `-- mod.rs
+|       `-- uhid.rs
+|-- pc-usbip-runner/
+|   |-- Cargo.toml
+|   |-- Dockerfile
+|   |-- Makefile
+|   |-- README.md
+|   |-- examples/
+|   `-- src/
+|-- prebuilt_liboqs/
+|   |-- linux-aarch64/
+|   |   |-- include/oqs/
+|   |   `-- lib/
+|   `-- linux-x86_64/
+|       |-- include/oqs/
+|       `-- lib/
+|-- target/
+|   `-- ... (build artifacts)
+|-- transport-core/
+|   |-- Cargo.toml
+|   `-- src/
+|       |-- ctap/
+|       |-- lib.rs
+|       |-- logging.rs
+|       `-- state.rs
+|-- trussed-mldsa/
+|   |-- Cargo.toml
+|   |-- build.rs
+|   `-- src/lib.rs
+|-- trussed-mlkem/
+|   |-- Cargo.toml
+|   |-- build.rs
+|   `-- src/lib.rs
+|-- Cargo.toml
+`-- README.md
 ```
 
 ## Dependencies
